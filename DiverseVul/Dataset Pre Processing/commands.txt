@@ -1,0 +1,11 @@
+# For 1.5B model
+python PreProcessing.py \
+    --input  data/RDiverseVul.jsonl \
+    --output data/splits/ \
+    --max_length 2048
+
+# For 7B model
+python PreProcessing.py \
+    --input  data/RDiverseVul.jsonl \
+    --output data/splits_7b/ \
+    --max_length 4096
