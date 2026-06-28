@@ -1,0 +1,28 @@
+backbone:
+  name: "chandar-lab/NeoBERT"
+  max_seq_len: 4096
+  use_unpadding: false          
+  output_attentions_dtype: "float32"  
+
+tokenizer:
+  padding: "max_length"
+  truncation: true
+
+training:
+  batch_size: 8
+  grad_accumulation_steps: 4
+  lr: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  epochs: 3
+  fp16: true
+  seed: 42
+
+cv:
+  n_splits: 5
+  random_state: 42
+  test_size: 0.2
+
+exp2_probe:
+  freeze_backbone: true
+  classifier_dropout: 0.1

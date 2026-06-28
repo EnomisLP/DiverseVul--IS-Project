@@ -1,0 +1,21 @@
+lora:                          # Phase 1 — EXP_3
+  target_modules: ["query", "value"]
+  r: [8, 16]                   
+  lora_alpha: 16
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "SEQ_CLS"
+  epochs: 3
+  lr: 2.0e-4
+
+reft:                          # Phase 2 — EXP_4
+  layers: [12, 16, 20, 24]     
+  r: [4, 8]                    
+  prefix_length: 2
+  lr: 5.0e-5
+  epochs: 3
+  freeze_lora: true            
+
+cross_model:                   # EXP_5
+  backbone: "answerdotai/ModernBERT-base"
+  use_same_heft_config: true   # identical LoRA + ReFT settings as EXP_4

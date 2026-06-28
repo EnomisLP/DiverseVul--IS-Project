@@ -1,0 +1,576 @@
+VULNERABILITY DETECTION SYSTEM — PROJECT INSTRUCTIONS
+======================================================
+Author note: Read this file fully before opening any notebook.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+0. WHAT THIS PROJECT IS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A binary classifier for C/C++ functions: vulnerable (1) vs non-vulnerable (0).
+
+Two parallel tracks:
+
+  Track A — classical baseline
+    EXP_0  Logistic Regression on TF-IDF features
+    EXP_1  Random Forest on TF-IDF features
+
+  Track B — deep learning (HEFT: two-phase PEFT)
+    EXP_2  Frozen NeoBERT backbone + linear head (probe)
+    EXP_3  NeoBERT + LoRA on W_q and W_v, rank ∈ {8, 16}
+    EXP_4  Freeze EXP_3 LoRA → apply ReFT on layers {12,16,20,24}, rank ∈ {4, 8}
+    EXP_5  Identical to EXP_4 with ModernBERT-Base backbone
+
+Dataset: RDiverseVul (Refined DiverseVul, Feb 2025).
+Methodology: KDD. Evaluation: Stratified 5-fold CV + locked 20% holdout.
+Primary metric: PR-AUC (dataset is class-imbalanced; accuracy is not used).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PREREQUISITES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You need:
+  - A Google account with Google Drive access
+  - Google Colab (free tier works for Track A; Track B requires Colab Pro
+    or a GPU runtime — NeoBERT-250M will not train in reasonable time on CPU)
+  - Access to the GitHub repository
+  - The RDiverseVul dataset file (.csv or .jsonl) — obtained separately,
+    NOT stored in the repository (it is gitignored)
+
+Python dependencies are listed in requirements.txt and installed automatically
+by the setup notebook (00_setup.ipynb). Do not manually pip-install things
+before running 00_setup.ipynb or you risk version conflicts.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. ONE-TIME LOCAL SETUP (only if working locally, not Colab)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If you prefer to run locally (not recommended for Track B):
+
+  git clone <repo-url> vuln-detection
+  cd vuln-detection
+  pip install -e .
+
+Then place the RDiverseVul file in data/raw/ and proceed directly to
+section 4 (Running the Experiments), skipping the Colab steps.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. SWITCHING FROM GIT TO GOOGLE COLAB — STEP BY STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the standard workflow every time you start a new Colab session.
+Colab runtimes are ephemeral — the disk is wiped when the session ends.
+Everything that must persist (metrics, figures, checkpoints) is either
+committed to Git or saved to Google Drive.
+
+STEP 1 — Open Google Colab
+  Go to https://colab.research.google.com
+  Select "New notebook" or open notebooks/00_setup.ipynb directly from
+  GitHub: File → Open notebook → GitHub tab → paste the repo URL.
+
+STEP 2 — Select a GPU runtime (Track B only)
+  Runtime → Change runtime type → Hardware accelerator → GPU (T4 or better).
+  For Track A only, CPU is sufficient.
+
+STEP 3 — Mount Google Drive (optional but recommended)
+  Run this cell at the top of any notebook:
+
+      from google.colab import drive
+      drive.mount('/content/drive')
+
+  This lets you persist the RDiverseVul file and checkpoints across sessions
+  without re-uploading them every time. Create a folder in your Drive such as:
+      My Drive/vuln-detection-data/
+
+STEP 4 — Clone the repository
+  In the first code cell of 00_setup.ipynb (or manually):
+
+      !git clone https://github.com/<org>/<repo>.git /content/vuln-detection
+      %cd /content/vuln-detection
+
+  If you need a specific branch:
+      !git clone -b <branch-name> https://github.com/<org>/<repo>.git /content/vuln-detection
+
+STEP 5 — Install the package
+  Still in 00_setup.ipynb:
+
+      !pip install -e .
+
+  This installs the src/ directory as an editable package so that all
+  notebooks can do `from src.data import ...` without sys.path hacks.
+  It also installs all dependencies from requirements.txt.
+
+STEP 6 — Load the dataset
+  Copy RDiverseVul into the correct location. Two options:
+
+  Option A — From Google Drive (recommended, avoids re-uploading):
+      !cp "/content/drive/MyDrive/vuln-detection-data/rdiversevul.jsonl" \
+          /content/vuln-detection/data/raw/
+
+  Option B — Upload directly (will be lost when the session ends):
+      from google.colab import files
+      uploaded = files.upload()   # select the file in the dialog
+      !mv rdiversevul.jsonl /content/vuln-detection/data/raw/
+
+  The file must land in data/raw/. The loader (src/data.py) will auto-detect
+  the first .csv or .jsonl it finds in that directory.
+
+
+STEP 7 — Run notebooks in order
+  See section 4 below.
+
+IMPORTANT — SESSION RESTARTS:
+  Every time Colab disconnects or the runtime restarts, you must redo
+  steps 4–6 (clone, pip install, copy dataset). Steps 1–3 and 7 are
+  one-time per session only. This is normal Colab behaviour.
+  The dataset and checkpoints stored in Google Drive are always safe.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. RUNNING THE EXPERIMENTS — NOTEBOOK ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run notebooks strictly in numerical order. Each one depends on outputs
+produced by the previous ones.
+
+────────────────────────────────────────────────────
+00_setup.ipynb  — Environment bootstrap
+────────────────────────────────────────────────────
+What it does:
+  - Clones the repo and installs dependencies (if not already done)
+  - Verifies GPU availability
+  - Downloads/checks the NeoBERT tokenizer and model weights from HuggingFace
+    (this caches them in ~/.cache/huggingface and avoids re-downloading later)
+  - Prints a system info summary (CUDA version, RAM, disk)
+
+When to re-run: Only at the start of a new Colab session, or after
+adding a new dependency to requirements.txt.
+
+────────────────────────────────────────────────────
+01_track_a.ipynb  — Track A: TF-IDF + LR + RF
+────────────────────────────────────────────────────
+What it does:
+  1. Loads RDiverseVul via src.data.load_rdiversevul
+  2. Creates the holdout split via src.data.make_holdout_split
+     (saves train_idx.npy and holdout_idx.npy to data/splits/)
+     IMPORTANT: this must happen exactly once. If you re-run this cell
+     a second time in the same session it will raise FileExistsError —
+     this is intentional. Pass overwrite=True only if you want a new split.
+  3. Runs 5-fold CV for EXP_0 (Logistic Regression) and EXP_1 (Random Forest)
+  4. Writes per-fold JSON files to results/metrics/
+  5. Saves PR curve PNGs to results/figures/
+
+Outputs committed to Git:
+  results/metrics/EXP_0_fold*.json
+  results/metrics/EXP_0_aggregate.json
+  results/metrics/EXP_1_fold*.json
+  results/metrics/EXP_1_aggregate.json
+  results/figures/EXP_0_pr_curves.png
+  results/figures/EXP_1_pr_curves.png
+
+Do NOT commit: data/splits/ (gitignored)
+
+────────────────────────────────────────────────────
+02_track_b_probe.ipynb  — EXP_2: frozen NeoBERT probe
+────────────────────────────────────────────────────
+What it does:
+  1. Loads the split indices created in 01 (not the raw data again)
+  2. Loads NeoBERT with both bug fixes (use_unpadding=False, float32 head)
+  3. Freezes the backbone; trains only the 2-class linear head
+  4. 5-fold CV → per-fold JSON metrics
+
+Purpose: establishes a strong baseline for what NeoBERT "already knows"
+without any fine-tuning. If EXP_3 does not improve on EXP_2, LoRA is not
+adding value.
+
+────────────────────────────────────────────────────
+03_track_b_lora.ipynb  — EXP_3: LoRA fine-tuning
+────────────────────────────────────────────────────
+What it does:
+  1. For each rank r ∈ {8, 16} (from configs/heft.yaml):
+     a. Injects LoRA adapters into W_q and W_v of NeoBERT
+     b. Trains for 3 epochs with AdamW + linear warmup/decay
+     c. Saves adapter weights (NOT the full model) to:
+            results/checkpoints/EXP_3_r{r}/fold{N}/
+     d. Writes per-fold JSON metrics
+  2. Selects the best rank by mean CV PR-AUC
+  3. Prints the path to the best fold checkpoint — you will need this for 04
+
+After this notebook: pick the best EXP_3 checkpoint directory and note it
+down. It is passed into 04_track_b_heft.ipynb as lora_checkpoint_dir.
+
+────────────────────────────────────────────────────
+04_track_b_heft.ipynb  — EXP_4 + EXP_5: full HEFT
+────────────────────────────────────────────────────
+What it does:
+  1. For each (lora_r, reft_r) combination from configs/heft.yaml:
+     a. Loads the frozen EXP_3 LoRA checkpoint (DO NOT retrain LoRA here)
+     b. Applies LoreftIntervention on hidden states at layers {12,16,20,24}
+     c. Trains ReFT parameters only (LoRA is fully frozen)
+     d. Saves ReFT adapter weights to:
+            results/checkpoints/EXP_4_lorar{lora_r}_reftr{reft_r}/fold{N}/
+  2. Repeats the above with backbone swapped to ModernBERT-Base (EXP_5)
+  3. Writes all metrics to results/metrics/
+
+You MUST set lora_checkpoint_dir at the top of this notebook to the best
+EXP_3 checkpoint path identified in 03_track_b_lora.ipynb.
+
+────────────────────────────────────────────────────
+05_results.ipynb  — Final holdout evaluation + comparison
+────────────────────────────────────────────────────
+What it does:
+  1. Loads all CV aggregate metrics from results/metrics/
+  2. Selects the best hyperparameters per experiment based on CV PR-AUC
+  3. Calls evaluate_on_holdout for each experiment (touches the locked 20%
+     for the FIRST and ONLY time)
+  4. Produces comparison tables (Track A vs Track B)
+  5. Saves holdout PR curves to results/figures/
+
+CRITICAL: Do not run this notebook — or any holdout evaluation — until all
+CV hyperparameter decisions are finalised. The holdout is a one-shot test.
+Running it to "check progress" invalidates the experimental protocol.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. WHAT IS COMMITTED TO GIT vs WHAT IS NOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COMMITTED (source of truth):
+  src/               all Python source modules
+  configs/           all YAML config files
+  notebooks/         all .ipynb files
+  results/metrics/   per-fold and aggregate JSON files
+  results/figures/   PR curve PNGs
+  requirements.txt
+  setup.py
+  README.md
+  data/.gitkeep      (directory marker only)
+  .gitignore
+
+NOT COMMITTED (gitignored, regenerated or too large):
+  data/raw/          dataset file — load manually each session
+  data/processed/    intermediate files — regenerated at runtime
+  data/splits/       train_idx.npy, holdout_idx.npy, split_meta.json
+                     (regenerated by 01_track_a.ipynb on first run)
+  results/checkpoints/  adapter weights — save to Google Drive instead
+
+WHERE TO KEEP CHECKPOINTS:
+  Save results/checkpoints/ to Google Drive after each notebook completes:
+
+      !cp -r /content/vuln-detection/results/checkpoints/ \
+             "/content/drive/MyDrive/vuln-detection-data/checkpoints/"
+
+  At the start of a new session, restore them:
+
+      !cp -r "/content/drive/MyDrive/vuln-detection-data/checkpoints/" \
+             /content/vuln-detection/results/checkpoints/
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. HOW THE SOURCE FILES ARE INTERCONNECTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The dependency graph below shows what each file imports from other files
+in the project. Read it top to bottom: lower rows depend on higher rows.
+
+  ┌─────────────────────────────────────────────────┐
+  │  configs/track_a.yaml   configs/track_b.yaml    │
+  │  configs/heft.yaml                              │
+  └───────────────────┬─────────────────────────────┘
+                      │ loaded by load_config()
+  ┌───────────────────▼─────────────────────────────┐
+  │  src/utils.py                                   │
+  │  • get_logger        — used by every module     │
+  │  • set_seed          — called at top of runners │
+  │  • load_config       — reads YAML → namespace   │
+  │  • compute_class_weights / class_weights_tensor │
+  │  • save_metrics / load_metrics                  │
+  │  • generate_exp_id                              │
+  └──┬──────────────────────────────────────────────┘
+     │
+     ├──────────────────────────────────────────────────────┐
+     │                                                      │
+  ┌──▼──────────────────────┐          ┌────────────────────▼───┐
+  │  src/data.py            │          │  src/evaluate.py        │
+  │  • load_rdiversevul     │          │  • compute_metrics      │
+  │  • make_holdout_split   │          │  • evaluate_fold        │
+  │  • load_holdout_split   │          │  • evaluate_model       │
+  │  • get_cv_folds         │          │  • aggregate_fold_metrics│
+  │  • get_texts_and_labels │          │  • plot_pr_curve        │
+  │                         │          │  • plot_all_folds_…     │
+  └──┬──────────────────────┘          └────────────┬───────────┘
+     │                                              │
+     │          Track A                             │
+     │  ┌───────────────────────────────────────┐   │
+     │  │  src/track_a/features.py              │   │
+     │  │  • TFIDFPipeline (fit inside fold)    │   │
+     │  │  • build_tfidf_pipeline               │   │
+     │  └──────────────┬────────────────────────┘   │
+     │                 │                            │
+     │  ┌──────────────▼────────────────────────┐   │
+     │  │  src/track_a/models.py                │   │
+     │  │  • build_logistic_regression (EXP_0)  │   │
+     │  │  • build_random_forest       (EXP_1)  │   │
+     │  │  • build_model(exp_id, cfg)            │   │
+     │  └──────────────┬────────────────────────┘   │
+     │                 │                            │
+     │  ┌──────────────▼────────────────────────┐   │
+     │  │  src/track_a/train.py                 │◄──┘
+     │  │  imports: data, evaluate, features,   │
+     │  │           models, utils               │
+     │  │  • run_experiment(EXP_0 or EXP_1)     │
+     │  │  • run_all_track_a                    │
+     │  │  • evaluate_on_holdout                │
+     │  └───────────────────────────────────────┘
+     │
+     │          Track B
+     │  ┌───────────────────────────────────────┐
+     │  │  src/track_b/dataset.py               │
+     │  │  • VulnDataset (lazy tokenisation)    │
+     │  │  • load_tokenizer_from_config         │
+     │  │  • make_collate_fn (batch padding)    │
+     │  │  • build_dataloader                   │
+     │  │  • build_fold_dataloaders             │
+     │  └──────────────┬────────────────────────┘
+     │                 │
+     │  ┌──────────────▼────────────────────────┐
+     │  │  src/track_b/model.py                 │
+     │  │  imports: utils                       │
+     │  │  • NeoBERTForVulnClassification       │
+     │  │    - forward()                        │
+     │  │    - freeze/unfreeze_backbone()       │
+     │  │    - get_backbone/head_params()       │
+     │  │  • build_model(cfg)  ← factory        │
+     │  └──────────────┬────────────────────────┘
+     │                 │
+     │  ┌──────────────▼────────────────────────┐
+     │  │  src/track_b/lora.py                  │
+     │  │  imports: model, utils                │
+     │  │  • apply_lora(model, cfg, r)          │
+     │  │  • save/load_lora_adapter             │
+     │  │  • freeze_lora   ← called before reft │
+     │  │  • get_lora_param_count               │
+     │  └──────────────┬────────────────────────┘
+     │                 │
+     │  ┌──────────────▼────────────────────────┐
+     │  │  src/track_b/reft.py                  │
+     │  │  imports: model, utils                │
+     │  │  • apply_reft(model, cfg, r)          │
+     │  │    (requires lora.freeze_lora first)  │
+     │  │  • save/load_reft_adapter             │
+     │  │  • reft_forward(model, ...)           │
+     │  │  • get_reft_param_count               │
+     │  └──────────────┬────────────────────────┘
+     │                 │
+     │  ┌──────────────▼────────────────────────┐
+     │  │  src/track_b/train.py                 │◄──┘
+     │  │  imports: data, evaluate, dataset,    │
+     │  │           model, lora, reft, utils    │
+     │  │  • run_experiment(EXP_2…EXP_5)        │
+     │  │  • run_all_track_b                    │
+     │  │  • evaluate_on_holdout                │
+     │  └───────────────────────────────────────┘
+
+CALL ORDER WITHIN A TRAINING RUN (Track B, EXP_4 example):
+
+  configs/heft.yaml
+        ↓ load_config()
+  src/utils.py
+        ↓
+  src/data.py          load_rdiversevul → make_holdout_split → get_cv_folds
+        ↓
+  src/track_b/dataset.py   VulnDataset → build_fold_dataloaders
+        ↓
+  src/track_b/model.py     build_model(cfg)          [fresh per fold]
+        ↓
+  src/track_b/lora.py      apply_lora(model, cfg, r=8)
+                           load_lora_adapter(model, best_exp3_dir)
+                           freeze_lora(model)
+        ↓
+  src/track_b/reft.py      apply_reft(model, cfg, r=4)
+        ↓
+  src/track_b/train.py     _train_epoch × 3 epochs   [reft_forward path]
+                           _eval_epoch
+        ↓
+  src/evaluate.py          evaluate_model → EvaluationResult → JSON
+                           plot_all_folds_pr_curves → PNG
+        ↓
+  src/utils.py             save_metrics
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. CONFIG FILES AND WHAT THEY CONTROL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+configs/track_a.yaml
+  Controls all Track A behaviour. Sections:
+    tfidf              — vocabulary size, n-gram range, sublinear TF
+    logistic_regression — penalty, C, solver (EXP_0)
+    random_forest      — n_estimators, max_features, criterion (EXP_1)
+    cv                 — n_splits, test_size (holdout fraction), random_state
+
+configs/track_b.yaml
+  Controls Track B model loading and training. Sections:
+    model    — HuggingFace model name (swap here for EXP_5), max_seq_length,
+               use_unpadding (must be false), attention_output_dtype (float32)
+    training — epochs, batch_size, lr, weight_decay, warmup_ratio, fp16
+    cv       — same structure as track_a.yaml cv section
+
+configs/heft.yaml
+  Controls LoRA and ReFT hyperparameters. Sections:
+    lora   — target_modules, r (list of ranks), lora_alpha, lora_dropout, bias
+    reft   — layers, r (list of ranks), prefix_length, intervention_type,
+             position, lr, epochs
+
+  NOTE: lora.r and reft.r are LISTS. The training loop iterates over them
+  automatically. To run a single rank, change the list to a single value,
+  e.g., r: [8] instead of r: [8, 16].
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. THE SPLIT SYSTEM — CRITICAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The data is split exactly once into:
+  80% training set  → used for CV (5 folds) and final model retraining
+  20% holdout set   → touched only in 05_results.ipynb
+
+This split is produced by make_holdout_split() in 01_track_a.ipynb and saved
+as numpy index arrays in data/splits/:
+  train_idx.npy     — integer row indices for the 80% training partition
+  holdout_idx.npy   — integer row indices for the 20% holdout partition
+  split_meta.json   — split parameters and label balance statistics
+
+These files are GITIGNORED. They are regenerated from the raw dataset at the
+start of each session by running cell 2 of 01_track_a.ipynb. If the files
+already exist (i.e., you ran the notebook twice), make_holdout_split() will
+raise FileExistsError — this prevents accidental re-splitting which would
+invalidate comparisons between experiments.
+
+The random_state in the config (default 42) guarantees the same split is
+produced every time from the same dataset. Do not change it mid-project.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. RESULTS FILE NAMING CONVENTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Metrics (results/metrics/):
+  {EXP_ID}_fold{N}.json           per-fold CV metrics
+  {EXP_ID}_aggregate.json         mean ± std across all folds
+  {EXP_ID}_holdout.json           final holdout evaluation
+
+Examples:
+  EXP_0_fold0.json
+  EXP_3_r8_aggregate.json
+  EXP_4_lorar8_reftr4_fold2.json
+  EXP_5_lorar16_reftr8_holdout.json
+
+Figures (results/figures/):
+  {EXP_ID}_pr_curves.png          all CV fold PR curves on one plot
+  {EXP_ID}_holdout_pr_curve.png   single holdout PR curve
+
+Checkpoints (results/checkpoints/, GITIGNORED):
+  {EXP_ID}/fold{N}/               adapter weights directory
+    adapter_model.bin or .safetensors   (LoRA deltas or ReFT params)
+    adapter_config.json
+    classifier_head.pt            always included alongside adapter
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. COMMON ISSUES AND FIXES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"ModuleNotFoundError: No module named 'src'"
+  → You forgot to run `pip install -e .` after cloning.
+    Run it and restart the kernel.
+
+"FileExistsError: Split files exist"
+  → make_holdout_split() already ran this session.
+    Call load_holdout_split() instead, or pass overwrite=True
+    only if you genuinely want a new random split.
+
+"FileNotFoundError: No .csv or .jsonl in data/raw/"
+  → The dataset file was not copied into data/raw/.
+    Follow section 3, Step 6.
+
+"CUDA out of memory"
+  → Reduce batch_size in configs/track_b.yaml (try 4 or 2).
+    Alternatively, reduce max_seq_length (try 512 or 1024 for debugging,
+    but use 4096 for final runs to match the paper).
+
+NaN loss during Track B training
+  → Both bug fixes in model.py must be active:
+      use_unpadding: false         (configs/track_b.yaml)
+      attention_output_dtype: float32   (configs/track_b.yaml)
+    If you are loading a checkpoint, verify it was saved with these fixes.
+
+"RuntimeError: ReFT has not been applied to this model"
+  → You called reft_forward() or save_reft_adapter() without first calling
+    apply_reft(). Check the setup cell in 04_track_b_heft.ipynb.
+
+"RuntimeError: Found N trainable LoRA parameter(s)"
+  → apply_reft() detected that freeze_lora() was not called before Phase 2.
+    Call lora.freeze_lora(model) before lora.apply_reft(model, ...).
+
+Colab session disconnected mid-training
+  → Results up to the last completed fold are already saved. You can resume
+    by skipping folds that already have checkpoint directories.
+    Checkpoints in Google Drive are safe. Rerun only the interrupted notebook.
+
+NeoBERT weights downloading slowly / failing
+  → Run 00_setup.ipynb once on a stable connection to cache the weights in
+    ~/.cache/huggingface. Subsequent runs will load from cache.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. PUSHING RESULTS BACK TO GIT FROM COLAB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After a notebook run completes, commit the metrics and figures:
+
+    %cd /content/vuln-detection
+    !git add results/metrics/ results/figures/
+    !git commit -m "Add EXP_3 CV metrics and PR curves"
+    !git push https://<PAT>@github.com/<org>/<repo>.git
+
+Do NOT add results/checkpoints/ — it is gitignored and the files are too
+large for GitHub. Keep checkpoints in Google Drive only.
+
+If you edited a source file in Colab (e.g., fixed a bug):
+    !git add src/track_b/train.py
+    !git commit -m "Fix: correct LR scheduler step in train.py"
+    !git push https://<PAT>@github.com/<org>/<repo>.git
+
+Always pull before starting a new session to get the latest source files:
+    !git pull origin main
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. QUICK REFERENCE — MOST COMMON COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Clone and install (run once per Colab session)
+!git clone https://github.com/<org>/<repo>.git /content/vuln-detection
+%cd /content/vuln-detection
+!pip install -e .
+
+# Copy dataset from Drive
+!cp "/content/drive/MyDrive/vuln-detection-data/rdiversevul.csv" data/raw/
+
+# Restore checkpoints from Drive
+!cp -r "/content/drive/MyDrive/vuln-detection-data/checkpoints/" results/checkpoints/
+
+# Save checkpoints to Drive after training
+!cp -r results/checkpoints/ "/content/drive/MyDrive/vuln-detection-data/checkpoints/"
+
+# Push results to Git
+!git add results/metrics/ results/figures/
+!git commit -m "your message"
+!git push https://<PAT>@github.com/<org>/<repo>.git
+
+# Pull latest source
+!git pull origin main
