@@ -1,8 +1,14 @@
-data/raw/
-data/processed/
-data/splits/
+data/raw/*
+!data/raw/.gitkeep
 
-results/checkpoints/
+data/processed/*
+!data/processed/.gitkeep
+
+data/splits/*
+!data/splits/.gitkeep
+
+results/checkpoints/*
+!results/checkpoints/.gitkeep
 
 __pycache__/
 *.py[cod]
