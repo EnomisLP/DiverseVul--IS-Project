@@ -19,3 +19,5 @@ wandb>=0.17.0
 
 ipywidgets>=8.1.0
 tqdm>=4.66.0
+
+layer_to_layer @ git+https://github.com/mryab/layer_to_layer.git
