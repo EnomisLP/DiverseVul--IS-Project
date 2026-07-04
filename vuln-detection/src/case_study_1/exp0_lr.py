@@ -1,5 +1,5 @@
 """
-CS1-EXP0: word + character TF-IDF with class-weighted Logistic Regression.
+CS1-EXP0: word + character TF-IDF with class-weighted SGD Logistic Regression.
 
 This module implements the first Case Study 1 experiment:
 
@@ -7,7 +7,7 @@ This module implements the first Case Study 1 experiment:
         -> word TF-IDF, n-grams (1, 3)
         +  character TF-IDF, n-grams (3, 4)
         -> sparse feature union
-        -> class-weighted L2 Logistic Regression
+        -> class-weighted L2 Logistic Regression trained with SGD
         -> 5-fold project-aware out-of-fold predictions
 
 The module has two execution modes:
@@ -45,7 +45,7 @@ import pandas as pd
 from scipy.sparse import hstack
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import SGDClassifier
 
 from .evaluation import (
     EvaluationConfig,
@@ -60,7 +60,7 @@ from .split_manifest import (
 )
 
 
-EXP0_VERSION = "cs1-exp0-lr-v2-profiled"
+EXP0_VERSION = "cs1-exp0-sgd-logistic-v1-profiled"
 
 
 @dataclass(frozen=True)
@@ -95,13 +95,15 @@ class Exp0Config:
     sublinear_tf: bool = True
     tfidf_norm: str = "l2"
 
-    # Class-weighted L2 Logistic Regression baseline.
-    logistic_c: float = 1.0
-    logistic_penalty: str = "l2"
-    logistic_solver: str = "saga"
-    logistic_class_weight: str = "balanced"
-    logistic_max_iter: int = 250
-    logistic_tol: float = 1e-2
+    # SGD-based binary Logistic Regression: scalable for sparse TF-IDF.
+    # loss="log_loss" is logistic regression trained via stochastic gradient descent.
+    sgd_loss: str = "log_loss"
+    sgd_penalty: str = "l2"
+    sgd_alpha: float = 1e-5
+    sgd_class_weight: str = "balanced"
+    sgd_max_iter: int = 80
+    sgd_tol: float = 1e-3
+    sgd_average: bool = True
 
     top_features_per_direction: int = 30
     verbose: bool = True
@@ -146,12 +148,16 @@ def _validate_config(config: Exp0Config) -> None:
         raise ValueError("word_min_df and char_min_df must be >= 1.")
     if config.word_max_features < 1 or config.char_max_features < 1:
         raise ValueError("word_max_features and char_max_features must be >= 1.")
-    if config.logistic_c <= 0:
-        raise ValueError("logistic_c must be > 0.")
-    if config.logistic_max_iter < 1:
-        raise ValueError("logistic_max_iter must be >= 1.")
-    if config.logistic_tol <= 0:
-        raise ValueError("logistic_tol must be > 0.")
+    if config.sgd_loss != "log_loss":
+        raise ValueError("CS1-EXP0 requires sgd_loss='log_loss' for Logistic Regression.")
+    if config.sgd_penalty != "l2":
+        raise ValueError("CS1-EXP0 requires sgd_penalty='l2' for the declared baseline.")
+    if config.sgd_alpha <= 0:
+        raise ValueError("sgd_alpha must be > 0.")
+    if config.sgd_max_iter < 1:
+        raise ValueError("sgd_max_iter must be >= 1.")
+    if config.sgd_tol <= 0:
+        raise ValueError("sgd_tol must be > 0.")
 
 
 def _require_columns(frame: pd.DataFrame, columns: Sequence[str]) -> None:
@@ -251,15 +257,17 @@ def _build_char_vectorizer(config: Exp0Config) -> TfidfVectorizer:
     )
 
 
-def _build_model(config: Exp0Config) -> LogisticRegression:
-    """Construct the declared class-weighted L2 Logistic Regression model."""
-    return LogisticRegression(
-        C=config.logistic_c,
-        penalty=config.logistic_penalty,
-        solver=config.logistic_solver,
-        class_weight=config.logistic_class_weight,
-        max_iter=config.logistic_max_iter,
-        tol=config.logistic_tol,
+def _build_model(config: Exp0Config) -> SGDClassifier:
+    """Construct scalable L2 Logistic Regression trained with SGD."""
+    return SGDClassifier(
+        loss=config.sgd_loss,
+        penalty=config.sgd_penalty,
+        alpha=config.sgd_alpha,
+        class_weight=config.sgd_class_weight,
+        max_iter=config.sgd_max_iter,
+        tol=config.sgd_tol,
+        average=config.sgd_average,
+        shuffle=True,
         random_state=config.random_state,
     )
 
@@ -334,7 +342,7 @@ def _fit_and_transform_fold(
 
 
 def _top_feature_rows(
-    model: LogisticRegression,
+    model: SGDClassifier,
     word_vectorizer: TfidfVectorizer,
     char_vectorizer: TfidfVectorizer,
     fold_id: int,
@@ -436,8 +444,9 @@ def _run_single_fold(
     model = _build_model(config)
 
     _log(
-        f"{fold_label} | training Logistic Regression "
-        f"(solver={config.logistic_solver}, max_iter={config.logistic_max_iter})...",
+        f"{fold_label} | training SGD Logistic Regression "
+        f"(loss={config.sgd_loss}, max_iter={config.sgd_max_iter}, "
+        f"alpha={config.sgd_alpha:g})...",
         config.verbose,
     )
     fit_start = time.perf_counter()
@@ -453,15 +462,18 @@ def _run_single_fold(
 
     fit_seconds = float(time.perf_counter() - fit_start)
     _log(
-        f"{fold_label} | Logistic Regression done in {_format_seconds(fit_seconds)} "
-        f"(iterations={int(np.max(model.n_iter_))}, "
+        f"{fold_label} | SGD Logistic Regression done in {_format_seconds(fit_seconds)} "
+        f"(epochs={int(model.n_iter_)}, "
         f"convergence warnings={len(convergence_messages)}).",
         config.verbose,
     )
 
     _log(f"{fold_label} | scoring held-out projects...", config.verbose)
     prediction_start = time.perf_counter()
-    y_score = model.predict_proba(x_test)[:, 1]
+    positive_class_indices = np.where(model.classes_ == 1)[0]
+    if len(positive_class_indices) != 1:
+        raise RuntimeError("The fitted SGD model does not expose class label 1.")
+    y_score = model.predict_proba(x_test)[:, int(positive_class_indices[0])]
     prediction_seconds = float(time.perf_counter() - prediction_start)
     _log(
         f"{fold_label} | scoring done in {_format_seconds(prediction_seconds)}.",
@@ -509,7 +521,8 @@ def _run_single_fold(
         "model_fit_seconds": fit_seconds,
         "prediction_seconds": prediction_seconds,
         "total_fold_seconds": total_fold_seconds,
-        "logistic_n_iter": int(np.max(model.n_iter_)),
+        "model_n_iter": int(model.n_iter_),
+        "optimizer": "SGDClassifier(loss=log_loss)",
         "convergence_warning_count": int(len(convergence_messages)),
         "convergence_warning_messages": " | ".join(convergence_messages),
         "score_min": float(np.min(y_score)),
@@ -696,12 +709,12 @@ def _save_exp0_artifacts(
         ),
         additional_metadata={
             "exp0_version": EXP0_VERSION,
-            "model": "class-weighted L2 Logistic Regression",
+            "model": "class-weighted L2 Logistic Regression optimized with SGDClassifier(loss=log_loss)",
             "feature_representation": (
                 "word TF-IDF ngrams (1,3) + character TF-IDF ngrams (3,4)"
             ),
             "score_interpretation": (
-                "Class-weighted Logistic Regression risk score; not a calibrated "
+                "Class-weighted SGD Logistic Regression risk score; not a calibrated "
                 "real-world probability."
             ),
             **dict(additional_metadata or {}),
@@ -758,7 +771,8 @@ def run_exp0(
     _log(
         f"Configuration: word<= {config.word_max_features:,}, "
         f"char<= {config.char_max_features:,}, "
-        f"solver={config.logistic_solver}, max_iter={config.logistic_max_iter}.",
+        f"optimizer=SGDClassifier(log_loss), max_iter={config.sgd_max_iter}, "
+        f"alpha={config.sgd_alpha:g}.",
         config.verbose,
     )
 
