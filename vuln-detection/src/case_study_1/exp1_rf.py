@@ -45,6 +45,14 @@ from scipy.sparse import hstack
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+)
 
 from .evaluation import (
     EvaluationConfig,
@@ -60,7 +68,7 @@ from .split_manifest import (
 from .static_features import FEATURE_COLUMNS
 
 
-EXP1_VERSION = "cs1-exp1-svd-static-rf-v1"
+EXP1_VERSION = "cs1-exp1-svd-static-rf-v2-oob-threshold"
 
 
 @dataclass(frozen=True)
@@ -102,16 +110,25 @@ class Exp1Config:
     svd_n_oversamples: int = 10
 
     # Random Forest configuration.
-    rf_n_estimators: int = 300
+    # Profile-driven compute budget, fixed before the official run.
+    rf_n_estimators: int = 200
     rf_criterion: str = "gini"
     rf_max_depth: Optional[int] = None
     rf_min_samples_split: int = 2
     rf_min_samples_leaf: int = 2
     rf_max_features: str = "sqrt"
     rf_bootstrap: bool = True
-    rf_max_samples: Optional[float] = None
+    rf_max_samples: Optional[float] = 0.70
     rf_class_weight: str = "balanced_subsample"
     rf_n_jobs: int = -1
+    rf_oob_score: bool = True
+
+    # Threshold is selected only from OOB predictions of each outer-fold
+    # training partition. The held-out project data never participates.
+    oob_threshold_min: float = 0.005
+    oob_threshold_max: float = 0.250
+    oob_threshold_step: float = 0.005
+    oob_threshold_objective: str = "f1"
 
     feature_importance_top_n: int = 50
     verbose: bool = True
@@ -125,6 +142,9 @@ class Exp1Artifacts:
     fold_training_csv: Path
     feature_importances_csv: Path
     static_feature_importances_csv: Path
+    oob_operating_metrics_json: Path
+    oob_operating_fold_metrics_csv: Path
+    oob_operating_fold_summary_csv: Path
     run_metadata_json: Path
     evaluation_paths: object
 
@@ -181,6 +201,16 @@ def _validate_config(config: Exp1Config) -> None:
             raise ValueError("rf_max_samples requires rf_bootstrap=True.")
         if not 0.0 < float(config.rf_max_samples) <= 1.0:
             raise ValueError("rf_max_samples must be in (0, 1] when provided.")
+    if not config.rf_oob_score:
+        raise ValueError(
+            "EXP-1 v2 requires rf_oob_score=True for training-only threshold selection."
+        )
+    if not (0.0 < config.oob_threshold_min < config.oob_threshold_max < 1.0):
+        raise ValueError("Invalid OOB threshold range.")
+    if config.oob_threshold_step <= 0.0:
+        raise ValueError("oob_threshold_step must be positive.")
+    if config.oob_threshold_objective != "f1":
+        raise ValueError("This implementation currently supports oob_threshold_objective='f1'.")
 
 
 def _validate_dataset_with_folds(
@@ -497,9 +527,159 @@ def _build_model(config: Exp1Config) -> RandomForestClassifier:
         max_samples=config.rf_max_samples,
         class_weight=config.rf_class_weight,
         n_jobs=config.rf_n_jobs,
+        oob_score=config.rf_oob_score,
         random_state=config.random_state,
     )
 
+
+
+def _oob_threshold_candidates(config: Exp1Config) -> np.ndarray:
+    """Return a fixed, predeclared threshold grid for OOB F1 selection."""
+    grid = np.arange(
+        config.oob_threshold_min,
+        config.oob_threshold_max + (config.oob_threshold_step / 2.0),
+        config.oob_threshold_step,
+        dtype=float,
+    )
+    return np.clip(grid, 0.0, 1.0)
+
+
+def _binary_metrics_from_decisions(
+    labels: Sequence[int] | np.ndarray | pd.Series,
+    scores: Sequence[float] | np.ndarray | pd.Series,
+    decisions: Sequence[int] | np.ndarray | pd.Series,
+    threshold: float | None,
+) -> dict:
+    """Compute ranking and operating-point metrics from supplied decisions."""
+    y_true = np.asarray(labels, dtype=np.int8)
+    y_score = np.asarray(scores, dtype=float)
+    y_pred = np.asarray(decisions, dtype=np.int8)
+
+    if len(y_true) == 0 or not (len(y_true) == len(y_score) == len(y_pred)):
+        raise ValueError("labels, scores, and decisions must be aligned and non-empty.")
+    if not np.isin(y_true, [0, 1]).all() or not np.isin(y_pred, [0, 1]).all():
+        raise ValueError("labels and decisions must be binary.")
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    denominator_npv = tn + fn
+    npv = float(tn / denominator_npv) if denominator_npv else 0.0
+    return {
+        "n_samples": int(len(y_true)),
+        "vulnerable_1": int((y_true == 1).sum()),
+        "non_vulnerable_0": int((y_true == 0).sum()),
+        "positive_rate": float(y_true.mean()),
+        "threshold": None if threshold is None else float(threshold),
+        "average_precision_pr_auc": float(average_precision_score(y_true, y_score)),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) else 0.0,
+        "negative_predictive_value": npv,
+        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
+        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) else 0.0,
+        "true_negative": int(tn),
+        "false_positive": int(fp),
+        "false_negative": int(fn),
+        "true_positive": int(tp),
+        "predicted_positive": int(y_pred.sum()),
+        "predicted_positive_rate": float(y_pred.mean()),
+    }
+
+
+def _select_oob_threshold(
+    labels: np.ndarray,
+    oob_scores: np.ndarray,
+    config: Exp1Config,
+) -> tuple[float, dict]:
+    """Choose a threshold from OOB train scores only, maximizing F1 on a fixed grid."""
+    valid = np.isfinite(oob_scores) & (oob_scores >= 0.0) & (oob_scores <= 1.0)
+    if valid.sum() != len(labels):
+        raise RuntimeError(
+            "OOB decision scores are incomplete. Increase tree count or inspect RF setup."
+        )
+
+    candidates = _oob_threshold_candidates(config)
+    rows = []
+    best = None
+    for threshold in candidates:
+        decisions = (oob_scores >= threshold).astype(np.int8)
+        metrics = _binary_metrics_from_decisions(
+            labels=labels,
+            scores=oob_scores,
+            decisions=decisions,
+            threshold=float(threshold),
+        )
+        rows.append(metrics)
+        # Tie-break: higher precision, then fewer alerts. This is deterministic.
+        key = (metrics["f1"], metrics["precision"], -metrics["predicted_positive"])
+        if best is None or key > best[0]:
+            best = (key, metrics)
+
+    assert best is not None
+    summary = dict(best[1])
+    summary["selection_source"] = "training_oob_predictions"
+    summary["selection_objective"] = config.oob_threshold_objective
+    summary["candidate_count"] = int(len(candidates))
+    summary["candidate_min"] = float(candidates.min())
+    summary["candidate_max"] = float(candidates.max())
+    return float(summary["threshold"]), summary
+
+
+def _evaluate_foldwise_oob_thresholds(predictions: pd.DataFrame) -> dict:
+    """Evaluate decisions generated with per-fold OOB-selected thresholds."""
+    required = {"fold", "label", "y_score", "y_pred_oob_threshold", "selected_oob_threshold"}
+    missing = required.difference(predictions.columns)
+    if missing:
+        raise KeyError(f"Missing OOB operating-point columns: {sorted(missing)}")
+
+    fold_rows = []
+    for fold_id, group in predictions.groupby("fold", sort=True):
+        metric = _binary_metrics_from_decisions(
+            labels=group["label"],
+            scores=group["y_score"],
+            decisions=group["y_pred_oob_threshold"],
+            threshold=float(group["selected_oob_threshold"].iloc[0]),
+        )
+        metric["fold"] = int(fold_id)
+        metric["test_unique_projects"] = int(group["project"].nunique())
+        fold_rows.append(metric)
+
+    fold_metrics = pd.DataFrame(fold_rows).sort_values("fold").reset_index(drop=True)
+    pooled_metrics = _binary_metrics_from_decisions(
+        labels=predictions["label"],
+        scores=predictions["y_score"],
+        decisions=predictions["y_pred_oob_threshold"],
+        threshold=None,
+    )
+    pooled_metrics["threshold_strategy"] = "per_fold_training_oob_f1"
+    pooled_metrics["selected_threshold_min"] = float(predictions["selected_oob_threshold"].min())
+    pooled_metrics["selected_threshold_max"] = float(predictions["selected_oob_threshold"].max())
+    pooled_metrics["selected_threshold_mean"] = float(predictions["selected_oob_threshold"].mean())
+
+    summary_rows = []
+    metric_columns = [
+        "average_precision_pr_auc", "precision", "recall", "f1", "mcc",
+        "false_positive_rate", "predicted_positive_rate", "threshold",
+    ]
+    for column in metric_columns:
+        series = fold_metrics[column].astype(float)
+        summary_rows.append({
+            "metric": column,
+            "mean": float(series.mean()),
+            "std": float(series.std(ddof=1)),
+            "min": float(series.min()),
+            "max": float(series.max()),
+        })
+    return {
+        "pooled_metrics": pooled_metrics,
+        "fold_metrics": fold_metrics,
+        "fold_summary": pd.DataFrame(summary_rows),
+    }
 
 def _feature_importance_frame(
     model: RandomForestClassifier,
@@ -624,12 +804,38 @@ def _run_single_fold(
         config.verbose,
     )
 
-    _log(f"{label} | scoring held-out projects...", config.verbose)
-    prediction_start = time.perf_counter()
     positive_index = np.where(model.classes_ == 1)[0]
     if len(positive_index) != 1:
         raise RuntimeError("Random Forest does not expose positive class label 1.")
-    y_score = model.predict_proba(x_test)[:, int(positive_index[0])]
+    positive_index = int(positive_index[0])
+
+    _log(
+        f"{label} | selecting threshold from training-only OOB predictions...",
+        config.verbose,
+    )
+    oob_start = time.perf_counter()
+    if not hasattr(model, "oob_decision_function_"):
+        raise RuntimeError("RF OOB predictions are unavailable; set rf_oob_score=True.")
+    oob_scores = np.asarray(
+        model.oob_decision_function_[:, positive_index],
+        dtype=np.float64,
+    )
+    selected_threshold, oob_threshold_metrics = _select_oob_threshold(
+        labels=y_train,
+        oob_scores=oob_scores,
+        config=config,
+    )
+    oob_selection_seconds = float(time.perf_counter() - oob_start)
+    _log(
+        f"{label} | OOB F1 threshold={selected_threshold:.3f} "
+        f"(OOB F1={oob_threshold_metrics['f1']:.4f}).",
+        config.verbose,
+    )
+
+    _log(f"{label} | scoring held-out projects...", config.verbose)
+    prediction_start = time.perf_counter()
+    y_score = model.predict_proba(x_test)[:, positive_index]
+    y_pred_oob_threshold = (y_score >= selected_threshold).astype(np.int8)
     prediction_seconds = float(time.perf_counter() - prediction_start)
 
     predictions = test_frame[
@@ -648,6 +854,8 @@ def _run_single_fold(
         }
     )
     predictions["y_score"] = y_score.astype(np.float64)
+    predictions["selected_oob_threshold"] = float(selected_threshold)
+    predictions["y_pred_oob_threshold"] = y_pred_oob_threshold.astype(np.int8)
 
     importances = _feature_importance_frame(
         model=model,
@@ -675,6 +883,13 @@ def _run_single_fold(
         "dense_feature_concatenation_seconds": float(concatenate_seconds),
         "final_dense_features": int(expected_dense_features),
         "model_fit_seconds": float(model_fit_seconds),
+        "oob_threshold_selection_seconds": float(oob_selection_seconds),
+        "selected_oob_threshold": float(selected_threshold),
+        "oob_average_precision_pr_auc": float(oob_threshold_metrics["average_precision_pr_auc"]),
+        "oob_precision": float(oob_threshold_metrics["precision"]),
+        "oob_recall": float(oob_threshold_metrics["recall"]),
+        "oob_f1": float(oob_threshold_metrics["f1"]),
+        "oob_mcc": float(oob_threshold_metrics["mcc"]),
         "prediction_seconds": float(prediction_seconds),
         "total_fold_seconds": float(total_seconds),
         "optimizer": "RandomForestClassifier",
@@ -714,8 +929,9 @@ def run_exp1_profile_fold(
     """
     Run one fold only for computational feasibility validation.
 
-    The returned metrics are descriptive for a single fold. They are not the
-    official EXP-1 result and must not be used to tune the configuration.
+    The returned thresholded metrics use a threshold selected solely from
+    training-partition OOB predictions. They remain descriptive for one outer
+    fold and are not the official five-fold EXP-1 result.
     """
     _validate_config(config)
     if fold_id not in range(config.n_splits):
@@ -750,7 +966,15 @@ def run_exp1_profile_fold(
         config=config,
     )
 
-    metrics = compute_binary_metrics(
+    selected_threshold = float(predictions["selected_oob_threshold"].iloc[0])
+    metrics = _binary_metrics_from_decisions(
+        labels=predictions["label"],
+        scores=predictions["y_score"],
+        decisions=predictions["y_pred_oob_threshold"],
+        threshold=selected_threshold,
+    )
+    metrics["threshold_strategy"] = "training_oob_f1"
+    default_threshold_metrics = compute_binary_metrics(
         labels=predictions["label"],
         scores=predictions["y_score"],
         threshold=config.decision_threshold,
@@ -771,6 +995,7 @@ def run_exp1_profile_fold(
         "feature_importances": importances,
         "training_metadata": pd.DataFrame([metadata]),
         "profile_metrics": metrics,
+        "default_threshold_metrics": default_threshold_metrics,
     }
 
 
@@ -787,6 +1012,7 @@ def _save_exp1_artifacts(
     fold_training = results["fold_training"]
     feature_importances = results["feature_importances"]
     evaluation = results["evaluation"]
+    oob_operating_evaluation = results["oob_operating_evaluation"]
 
     if not isinstance(oof_predictions, pd.DataFrame):
         raise TypeError("oof_predictions must be a DataFrame.")
@@ -796,6 +1022,8 @@ def _save_exp1_artifacts(
         raise TypeError("feature_importances must be a DataFrame.")
     if not isinstance(evaluation, Mapping):
         raise TypeError("evaluation must be a mapping.")
+    if not isinstance(oob_operating_evaluation, Mapping):
+        raise TypeError("oob_operating_evaluation must be a mapping.")
 
     safe_name = "".join(
         char if char.isalnum() or char in {"_", "-"} else "_"
@@ -807,6 +1035,15 @@ def _save_exp1_artifacts(
     feature_importances_csv = output_dir / f"{safe_name}_feature_importances.csv"
     static_feature_importances_csv = (
         output_dir / f"{safe_name}_static_feature_importances.csv"
+    )
+    oob_operating_metrics_json = (
+        output_dir / f"{safe_name}_oob_operating_pooled_metrics.json"
+    )
+    oob_operating_fold_metrics_csv = (
+        output_dir / f"{safe_name}_oob_operating_fold_metrics.csv"
+    )
+    oob_operating_fold_summary_csv = (
+        output_dir / f"{safe_name}_oob_operating_fold_summary.csv"
     )
     run_metadata_json = output_dir / f"{safe_name}_run_metadata.json"
 
@@ -828,6 +1065,17 @@ def _save_exp1_artifacts(
         .reset_index(drop=True)
     )
     static_importances.to_csv(static_feature_importances_csv, index=False)
+
+    with oob_operating_metrics_json.open("w", encoding="utf-8") as file:
+        json.dump(oob_operating_evaluation["pooled_metrics"], file, indent=2)
+    oob_operating_evaluation["fold_metrics"].to_csv(
+        oob_operating_fold_metrics_csv,
+        index=False,
+    )
+    oob_operating_evaluation["fold_summary"].to_csv(
+        oob_operating_fold_summary_csv,
+        index=False,
+    )
 
     evaluation_paths = save_evaluation_artifacts(
         evaluation=evaluation,
@@ -853,6 +1101,10 @@ def _save_exp1_artifacts(
             "score_interpretation": (
                 "Random Forest positive-class score; not a calibrated "
                 "real-world vulnerability probability."
+            ),
+            "operating_threshold_strategy": (
+                "Per-fold threshold selected by maximum F1 on training-only "
+                "out-of-bag predictions over a fixed grid from 0.005 to 0.250."
             ),
             "importance_note": (
                 "Random Forest impurity importances are descriptive diagnostics, "
@@ -894,6 +1146,9 @@ def _save_exp1_artifacts(
         fold_training_csv=fold_training_csv,
         feature_importances_csv=feature_importances_csv,
         static_feature_importances_csv=static_feature_importances_csv,
+        oob_operating_metrics_json=oob_operating_metrics_json,
+        oob_operating_fold_metrics_csv=oob_operating_fold_metrics_csv,
+        oob_operating_fold_summary_csv=oob_operating_fold_summary_csv,
         run_metadata_json=run_metadata_json,
         evaluation_paths=evaluation_paths,
     )
@@ -984,12 +1239,18 @@ def run_exp1(
     if oof_predictions["source_row_id"].duplicated().any():
         raise RuntimeError("Duplicate source_row_id detected in OOF predictions.")
 
+    # This standard evaluation retains PR curves and a fixed 0.50 diagnostic.
+    # EXP-1's primary thresholded operating metrics are stored separately below,
+    # using per-fold thresholds selected only from training OOB predictions.
     evaluation = evaluate_oof_predictions(
         oof_predictions,
         config=EvaluationConfig(
             threshold=config.decision_threshold,
             expected_n_folds=config.n_splits,
         ),
+    )
+    oob_operating_evaluation = _evaluate_foldwise_oob_thresholds(
+        oof_predictions
     )
 
     total_runtime_seconds = float(time.perf_counter() - run_started)
@@ -1003,6 +1264,7 @@ def run_exp1(
         "feature_importances": feature_importances,
         "fold_training": fold_training,
         "evaluation": evaluation,
+        "oob_operating_evaluation": oob_operating_evaluation,
         "total_runtime_seconds": total_runtime_seconds,
     }
 
