@@ -8,7 +8,7 @@ This module implements the first Case Study 1 experiment:
         +  character TF-IDF, n-grams (3, 4)
         -> sparse feature union
         -> class-weighted L2 Logistic Regression trained with SGD
-        -> 5-fold within-project StratifiedKFold out-of-fold predictions
+        -> 5-fold project-aware out-of-fold predictions
 
 The module has two execution modes:
 1. run_exp0_profile_fold(...)
@@ -20,10 +20,8 @@ The module has two execution modes:
 Leakage control
 ---------------
 For every fold, both TF-IDF vectorizers are fitted only on the training
-partition. The held-out functions are transformed using only the training
-vocabulary/IDF statistics. Unlike grouped CV, the same project may occur in
-both training and test partitions; that is deliberate for this secondary
-within-project protocol.
+partition. The held-out project fold is transformed using the training
+vocabulary/IDF statistics only.
 
 Interpretation
 --------------
@@ -55,14 +53,14 @@ from .evaluation import (
     evaluate_oof_predictions,
     save_evaluation_artifacts,
 )
-from .within_project_manifest import (
-    WithinProjectSplitConfig,
+from .split_manifest import (
+    SplitConfig,
     apply_manifest,
-    assert_within_project_manifest_integrity,
+    assert_manifest_integrity,
 )
 
 
-EXP0_VERSION = "cs1-exp0-sgd-logistic-v1-within-project"
+EXP0_VERSION = "cs1-exp0-sgd-logistic-v1-profiled"
 
 
 @dataclass(frozen=True)
@@ -470,7 +468,7 @@ def _run_single_fold(
         config.verbose,
     )
 
-    _log(f"{fold_label} | scoring mixed-project held-out functions...", config.verbose)
+    _log(f"{fold_label} | scoring held-out projects...", config.verbose)
     prediction_start = time.perf_counter()
     positive_class_indices = np.where(model.classes_ == 1)[0]
     if len(positive_class_indices) != 1:
@@ -519,21 +517,6 @@ def _run_single_fold(
         "test_positive_rate": float(test_frame[config.label_column].mean()),
         "train_unique_projects": int(train_frame[config.project_column].nunique()),
         "test_unique_projects": int(test_frame[config.project_column].nunique()),
-        "train_test_project_overlap": int(
-            len(
-                set(train_frame[config.project_column]).intersection(
-                    set(test_frame[config.project_column])
-                )
-            )
-        ),
-        "overlap_rate_of_test_projects": float(
-            len(
-                set(train_frame[config.project_column]).intersection(
-                    set(test_frame[config.project_column])
-                )
-            )
-            / max(1, test_frame[config.project_column].nunique())
-        ),
         **vector_metadata,
         "model_fit_seconds": fit_seconds,
         "prediction_seconds": prediction_seconds,
@@ -558,18 +541,35 @@ def _run_single_fold(
     return prediction_frame, top_features, training_metadata
 
 
+def _validate_fold_project_separation(frame: pd.DataFrame, config: Exp0Config) -> None:
+    """Independently verify the no-project-leakage property for every fold."""
+    for fold_id in range(config.n_splits):
+        test_projects = set(
+            frame.loc[frame[config.fold_column] == fold_id, config.project_column]
+        )
+        train_projects = set(
+            frame.loc[frame[config.fold_column] != fold_id, config.project_column]
+        )
+        overlap = test_projects.intersection(train_projects)
+        if overlap:
+            raise ValueError(
+                f"Project leakage detected in fold {fold_id}. "
+                f"Examples: {sorted(overlap)[:10]}"
+            )
+
+
 def _prepare_dataset_with_folds(
     normalized_frame: pd.DataFrame,
     manifest: pd.DataFrame,
     config: Exp0Config,
 ) -> pd.DataFrame:
     """Attach the immutable manifest and validate all EXP-0 inputs."""
-    split_config = WithinProjectSplitConfig(
+    split_config = SplitConfig(
         n_splits=config.n_splits,
         random_state=config.random_state,
         shuffle=True,
     )
-    assert_within_project_manifest_integrity(manifest, config=split_config)
+    assert_manifest_integrity(manifest, config=split_config)
 
     merged = apply_manifest(
         frame=normalized_frame,
@@ -577,6 +577,7 @@ def _prepare_dataset_with_folds(
         source_id_column=config.source_id_column,
     )
     merged = _validate_experiment_frame(merged, config)
+    _validate_fold_project_separation(merged, config)
     return merged
 
 
@@ -708,12 +709,6 @@ def _save_exp0_artifacts(
         ),
         additional_metadata={
             "exp0_version": EXP0_VERSION,
-            "evaluation_protocol": "within_project_stratified",
-            "protocol_interpretation": (
-                "Secondary within-project StratifiedKFold evaluation. "
-                "Project overlap between train and test partitions is deliberate "
-                "and expected; do not interpret as unseen-project generalization."
-            ),
             "model": "class-weighted L2 Logistic Regression optimized with SGDClassifier(loss=log_loss)",
             "feature_representation": (
                 "word TF-IDF ngrams (1,3) + character TF-IDF ngrams (3,4)"
@@ -762,15 +757,15 @@ def run_exp0(
     additional_metadata: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """
-    Run the official five-fold within-project StratifiedKFold CS1-EXP0-LR experiment.
+    Run the official five-fold project-aware CS1-EXP0-LR experiment.
 
-    Use run_exp0_profile_fold first after creating the frozen within-project
-    StratifiedKFold manifest in the active Colab environment.
+    Use run_exp0_profile_fold first if a new configuration has not been
+    computationally checked in the active Colab environment.
     """
     _validate_config(config)
 
     _log(
-        f"CS1-EXP0 official run started: {config.n_splits}-fold within-project StratifiedKFold.",
+        f"CS1-EXP0 official run started: {config.n_splits}-fold grouped CV.",
         config.verbose,
     )
     _log(
@@ -873,6 +868,164 @@ def run_exp0(
 
     return results
 
+def run_exp0_final_holdout(
+    dev_frame: pd.DataFrame,
+    holdout_frame: pd.DataFrame,
+    config: Exp0Config = Exp0Config(),
+    output_dir: Optional[Path | str] = None,
+    additional_metadata: Optional[Mapping[str, object]] = None,
+) -> dict:
+    """
+    Fit ONE final model on the ENTIRE development partition (80%), using the
+    configuration chosen via cross-validation / model selection, then score
+    the untouched 20% holdout exactly once.
+
+    Must only be called after model selection across EXP-0/EXP-1/... is
+    complete. The holdout must never be used to pick a config, model, or
+    threshold.
+    """
+    _validate_config(config)
+
+    required = [config.source_id_column, config.code_column, config.label_column, config.project_column]
+    _require_columns(dev_frame, required)
+    _require_columns(holdout_frame, required)
+
+    dev_projects = set(dev_frame[config.project_column].astype(str).str.strip())
+    holdout_projects = set(holdout_frame[config.project_column].astype(str).str.strip())
+    overlap = dev_projects & holdout_projects
+    if overlap:
+        raise RuntimeError(
+            f"Project leakage between dev and holdout: {sorted(overlap)[:10]}"
+        )
+
+    dev_clean = dev_frame.copy()
+    holdout_clean = holdout_frame.copy()
+    for frame in (dev_clean, holdout_clean):
+        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
+        labels = pd.to_numeric(frame[config.label_column], errors="raise")
+        if not labels.isin([0, 1]).all():
+            raise ValueError("label must be binary 0/1.")
+        frame[config.label_column] = labels.astype("int8")
+
+    if set(holdout_clean[config.label_column].unique().tolist()) != {0, 1}:
+        raise RuntimeError("Holdout partition does not contain both classes.")
+
+    _log("Fitting FINAL EXP-0 model on the full development partition (80%)...", config.verbose)
+
+    x_dev, x_holdout, word_vectorizer, char_vectorizer, vector_metadata = (
+        _fit_and_transform_fold(
+            train_code=dev_clean[config.code_column],
+            test_code=holdout_clean[config.code_column],
+            config=config,
+            fold_id=-1,
+        )
+    )
+
+    y_dev = dev_clean[config.label_column].to_numpy(dtype=np.int8)
+    model = _build_model(config)
+
+    fit_start = time.perf_counter()
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always", ConvergenceWarning)
+        model.fit(x_dev, y_dev)
+    fit_seconds = float(time.perf_counter() - fit_start)
+    convergence_messages = [
+        str(w.message) for w in caught_warnings if issubclass(w.category, ConvergenceWarning)
+    ]
+
+    _log("Scoring the EXP-0 HOLDOUT partition exactly once...", config.verbose)
+    y_holdout = holdout_clean[config.label_column].to_numpy(dtype=np.int8)
+    positive_index = np.where(model.classes_ == 1)[0]
+    if len(positive_index) != 1:
+        raise RuntimeError("The fitted SGD model does not expose class label 1.")
+    y_score = model.predict_proba(x_holdout)[:, int(positive_index[0])]
+
+    metrics = compute_binary_metrics(
+        labels=y_holdout, scores=y_score, threshold=config.decision_threshold
+    )
+
+    predictions_df = pd.DataFrame(
+        {
+            "source_row_id": holdout_clean[config.source_id_column].to_numpy(),
+            "label": y_holdout,
+            "project": holdout_clean[config.project_column].to_numpy(),
+            "y_score": y_score,
+            "y_pred": (y_score >= config.decision_threshold).astype(np.int8),
+        }
+    )
+
+    top_features = _top_feature_rows(
+        model=model,
+        word_vectorizer=word_vectorizer,
+        char_vectorizer=char_vectorizer,
+        fold_id=-1,
+        top_n=config.top_features_per_direction,
+    )
+
+    results = {
+        "experiment": "cs1_exp0_lr",
+        "model": model,
+        "word_vectorizer": word_vectorizer,
+        "char_vectorizer": char_vectorizer,
+        "predictions": predictions_df,
+        "metrics": metrics,
+        "top_features": top_features,
+        "vector_metadata": vector_metadata,
+        "fit_seconds": fit_seconds,
+        "convergence_warnings": convergence_messages,
+    }
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = config.experiment_name.strip().lower().replace(" ", "_")
+
+        predictions_path = output_dir / f"{safe_name}_holdout_predictions.parquet"
+        metrics_path = output_dir / f"{safe_name}_holdout_metrics.json"
+        top_features_path = output_dir / f"{safe_name}_holdout_top_features.csv"
+        pr_curve_path = output_dir / f"{safe_name}_holdout_precision_recall_curve.png"
+        cm_path = output_dir / f"{safe_name}_holdout_confusion_matrix.png"
+
+        predictions_df.to_parquet(predictions_path, index=False)
+        top_features.to_csv(top_features_path, index=False)
+        with metrics_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "exp0_version": EXP0_VERSION,
+                    "config": asdict(config),
+                    "metrics": metrics,
+                    "fit_seconds": fit_seconds,
+                    "n_dev_rows": int(len(dev_clean)),
+                    "n_holdout_rows": int(len(holdout_clean)),
+                    "additional_metadata": dict(additional_metadata or {}),
+                },
+                file,
+                indent=2,
+                default=str,
+            )
+
+        from .evaluation import plot_precision_recall_curve, plot_confusion_matrix
+        plot_precision_recall_curve(
+            labels=predictions_df["label"], scores=predictions_df["y_score"],
+            output_path=pr_curve_path,
+            title=f"{config.experiment_name}: FINAL Holdout Precision-Recall Curve",
+        )
+        plot_confusion_matrix(
+            labels=predictions_df["label"], predictions=predictions_df["y_pred"],
+            output_path=cm_path,
+            title=f"{config.experiment_name}: FINAL Holdout Confusion Matrix",
+        )
+        results["artifact_paths"] = {
+            "predictions": predictions_path,
+            "metrics": metrics_path,
+            "top_features": top_features_path,
+            "pr_curve": pr_curve_path,
+            "confusion_matrix": cm_path,
+        }
+        _log(f"EXP-0 holdout artifacts saved to: {output_dir}", config.verbose)
+
+    return results
+
 
 __all__ = [
     "EXP0_VERSION",
@@ -880,4 +1033,5 @@ __all__ = [
     "Exp0Config",
     "run_exp0",
     "run_exp0_profile_fold",
+    "run_exp0_final_holdout",
 ]

@@ -1280,10 +1280,163 @@ def run_exp1(
     return results
 
 
+def run_exp1_final_holdout(
+    dev_frame: pd.DataFrame,
+    static_features_frame: pd.DataFrame,
+    holdout_frame: pd.DataFrame,
+    config: Exp1Config = Exp1Config(),
+    output_dir: Optional[Path | str] = None,
+    additional_metadata: Optional[Mapping[str, object]] = None,
+) -> dict:
+    """
+    Fit ONE final EXP-1 model on the ENTIRE development partition (80%),
+    select the operating threshold from that same fit's training-only OOB
+    predictions, then score the untouched 20% holdout exactly once.
+    """
+    _validate_config(config)
+
+    required = [config.source_id_column, config.code_column, config.label_column, config.project_column]
+    _require_columns(dev_frame, required)
+    _require_columns(holdout_frame, required)
+
+    dev_projects = set(dev_frame[config.project_column].astype(str).str.strip())
+    holdout_projects = set(holdout_frame[config.project_column].astype(str).str.strip())
+    overlap = dev_projects & holdout_projects
+    if overlap:
+        raise RuntimeError(f"Project leakage between dev and holdout: {sorted(overlap)[:10]}")
+
+    dev_clean = dev_frame.copy()
+    holdout_clean = holdout_frame.copy()
+    for frame in (dev_clean, holdout_clean):
+        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
+        labels = pd.to_numeric(frame[config.label_column], errors="raise")
+        if not labels.isin([0, 1]).all():
+            raise ValueError("label must be binary 0/1.")
+        frame[config.label_column] = labels.astype("int8")
+
+    static_lookup = _validate_static_feature_frame(static_features_frame, config)
+
+    _log("Fitting FINAL EXP-1 lexical representation on full dev (80%)...", config.verbose)
+    x_dev_lexical, x_holdout_lexical, lexical_metadata = _fit_lexical_matrices(
+        train_code=dev_clean[config.code_column],
+        test_code=holdout_clean[config.code_column],
+        config=config,
+        fold_id=-1,
+    )
+    x_dev_svd, x_holdout_svd, svd_seconds, svd_variance_ratio = _fit_and_transform_svd(
+        x_train_lexical=x_dev_lexical,
+        x_test_lexical=x_holdout_lexical,
+        config=config,
+        fold_id=-1,
+    )
+
+    x_dev_static = _get_static_matrix(static_lookup, dev_clean[config.source_id_column], config)
+    x_holdout_static = _get_static_matrix(static_lookup, holdout_clean[config.source_id_column], config)
+
+    x_dev = np.hstack([x_dev_svd, x_dev_static]).astype(np.float32, copy=False)
+    x_holdout = np.hstack([x_holdout_svd, x_holdout_static]).astype(np.float32, copy=False)
+
+    y_dev = dev_clean[config.label_column].to_numpy(dtype=np.int8)
+    model = _build_model(config)
+
+    _log("Fitting FINAL EXP-1 Random Forest on full dev (80%)...", config.verbose)
+    fit_start = time.perf_counter()
+    model.fit(x_dev, y_dev)
+    fit_seconds = float(time.perf_counter() - fit_start)
+
+    positive_index = np.where(model.classes_ == 1)[0]
+    if len(positive_index) != 1:
+        raise RuntimeError("Random Forest does not expose positive class label 1.")
+    positive_index = int(positive_index[0])
+
+    if not hasattr(model, "oob_decision_function_"):
+        raise RuntimeError("RF OOB predictions are unavailable; set rf_oob_score=True.")
+    oob_scores = np.asarray(model.oob_decision_function_[:, positive_index], dtype=np.float64)
+    selected_threshold, oob_threshold_metrics = _select_oob_threshold(
+        labels=y_dev, oob_scores=oob_scores, config=config,
+    )
+    _log(
+        f"FINAL EXP-1 threshold selected from full-dev OOB: {selected_threshold:.3f} "
+        f"(OOB F1={oob_threshold_metrics['f1']:.4f}).",
+        config.verbose,
+    )
+
+    _log("Scoring the EXP-1 HOLDOUT partition exactly once...", config.verbose)
+    y_holdout = holdout_clean[config.label_column].to_numpy(dtype=np.int8)
+    y_score = model.predict_proba(x_holdout)[:, positive_index]
+    y_pred = (y_score >= selected_threshold).astype(np.int8)
+
+    metrics = _binary_metrics_from_decisions(
+        labels=y_holdout, scores=y_score, decisions=y_pred, threshold=selected_threshold,
+    )
+    metrics["threshold_strategy"] = "full_dev_training_oob_f1"
+
+    predictions_df = pd.DataFrame(
+        {
+            "source_row_id": holdout_clean[config.source_id_column].to_numpy(),
+            "label": y_holdout,
+            "project": holdout_clean[config.project_column].to_numpy(),
+            "y_score": y_score,
+            "selected_oob_threshold": float(selected_threshold),
+            "y_pred": y_pred,
+        }
+    )
+
+    importances = _feature_importance_frame(model=model, fold_id=-1, config=config)
+
+    results = {
+        "experiment": "cs1_exp1_rf",
+        "model": model,
+        "predictions": predictions_df,
+        "metrics": metrics,
+        "oob_threshold_metrics": oob_threshold_metrics,
+        "feature_importances": importances,
+        "fit_seconds": fit_seconds,
+        "svd_explained_variance_ratio_sum": svd_variance_ratio,
+    }
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = config.experiment_name.strip().lower().replace(" ", "_")
+
+        predictions_path = output_dir / f"{safe_name}_holdout_predictions.parquet"
+        metrics_path = output_dir / f"{safe_name}_holdout_metrics.json"
+        importances_path = output_dir / f"{safe_name}_holdout_feature_importances.csv"
+
+        predictions_df.to_parquet(predictions_path, index=False)
+        importances.to_csv(importances_path, index=False)
+        with metrics_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "exp1_version": EXP1_VERSION,
+                    "config": asdict(config),
+                    "metrics": metrics,
+                    "oob_threshold_metrics": oob_threshold_metrics,
+                    "fit_seconds": fit_seconds,
+                    "n_dev_rows": int(len(dev_clean)),
+                    "n_holdout_rows": int(len(holdout_clean)),
+                    "additional_metadata": dict(additional_metadata or {}),
+                },
+                file,
+                indent=2,
+                default=str,
+            )
+        results["artifact_paths"] = {
+            "predictions": predictions_path,
+            "metrics": metrics_path,
+            "feature_importances": importances_path,
+        }
+        _log(f"EXP-1 holdout artifacts saved to: {output_dir}", config.verbose)
+
+    return results
+
+
 __all__ = [
     "EXP1_VERSION",
     "Exp1Artifacts",
     "Exp1Config",
     "run_exp1",
     "run_exp1_profile_fold",
+    "run_exp1_final_holdout",
 ]
