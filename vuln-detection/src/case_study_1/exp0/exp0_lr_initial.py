@@ -8,17 +8,14 @@ This module implements the first Case Study 1 experiment:
         +  character TF-IDF, n-grams (3, 4)
         -> sparse feature union
         -> class-weighted L2 Logistic Regression trained with SGD
-        -> 5-fold project-aware development out-of-fold predictions
+        -> 5-fold project-aware out-of-fold predictions
 
 The module has two execution modes:
 1. run_exp0_profile_fold(...)
    Runs ONE held-out fold with detailed timing. Use this first to check whether
    the declared CPU configuration is practical in Google Colab.
 2. run_exp0(...)
-   Runs the complete five-fold development-CV experiment only after profiling is acceptable.
-3. run_exp0_final_holdout(...)
-   Fits one final model on all development projects and scores the frozen,
-   project-disjoint outer holdout exactly once.
+   Runs the complete five-fold experiment only after profiling is acceptable.
 
 Leakage control
 ---------------
@@ -50,20 +47,20 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
-from ..evaluation import (
+from .evaluation import (
     EvaluationConfig,
     compute_binary_metrics,
     evaluate_oof_predictions,
     save_evaluation_artifacts,
 )
-from ..split_manifest import (
+from .split_manifest import (
     SplitConfig,
     apply_manifest,
     assert_manifest_integrity,
 )
 
 
-EXP0_VERSION = "cs1-exp0-sgd-logistic-v2-holdout-innercv"
+EXP0_VERSION = "cs1-exp0-sgd-logistic-v1-profiled"
 
 
 @dataclass(frozen=True)
@@ -286,11 +283,7 @@ def _fit_and_transform_fold(
 
     Detailed stage timings are returned so Colab runs can be profiled.
     """
-    fold_label = (
-        "FINAL HOLDOUT"
-        if fold_id < 0
-        else f"Fold {fold_id + 1}/{config.n_splits}"
-    )
+    fold_label = f"Fold {fold_id + 1}/{config.n_splits}"
 
     word_vectorizer = _build_word_vectorizer(config)
     char_vectorizer = _build_char_vectorizer(config)
@@ -428,11 +421,7 @@ def _run_single_fold(
     config: Exp0Config,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Fit a model on one fold and return held-out predictions, explanations, and timings."""
-    fold_label = (
-        "FINAL HOLDOUT"
-        if fold_id < 0
-        else f"Fold {fold_id + 1}/{config.n_splits}"
-    )
+    fold_label = f"Fold {fold_id + 1}/{config.n_splits}"
     fold_start = time.perf_counter()
 
     _log(
@@ -879,104 +868,6 @@ def run_exp0(
 
     return results
 
-
-def _validate_final_holdout_partitions(
-    dev_frame: pd.DataFrame,
-    holdout_frame: pd.DataFrame,
-    config: Exp0Config,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Validate two frozen final-evaluation partitions.
-
-    The development and holdout frames must:
-    - contain the expected schema;
-    - have unique source IDs within and across partitions;
-    - contain non-empty normalized code and project IDs;
-    - contain binary labels and both classes;
-    - have zero project overlap.
-
-    This protects ``run_exp0_final_holdout`` even when it is called outside
-    the notebook workflow.
-    """
-    required = [
-        config.source_id_column,
-        config.code_column,
-        config.label_column,
-        config.project_column,
-    ]
-
-    _require_columns(dev_frame, required)
-    _require_columns(holdout_frame, required)
-
-    dev_clean = dev_frame.copy()
-    holdout_clean = holdout_frame.copy()
-
-    for partition_name, frame in (
-        ("development", dev_clean),
-        ("outer holdout", holdout_clean),
-    ):
-        if frame.empty:
-            raise ValueError(f"{partition_name} partition is empty.")
-
-        if frame[config.source_id_column].isna().any():
-            raise ValueError(
-                f"{partition_name} partition contains missing source_row_id values."
-            )
-        if frame[config.source_id_column].duplicated().any():
-            raise ValueError(
-                f"{partition_name} partition contains duplicate source_row_id values."
-            )
-
-        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
-        if (frame[config.code_column].str.strip() == "").any():
-            empty_count = int(
-                (frame[config.code_column].str.strip() == "").sum()
-            )
-            raise ValueError(
-                f"{partition_name} partition contains {empty_count:,} empty "
-                f"{config.code_column} value(s)."
-            )
-
-        frame[config.project_column] = (
-            frame[config.project_column].fillna("").astype(str).str.strip()
-        )
-        if (frame[config.project_column] == "").any():
-            raise ValueError(
-                f"{partition_name} partition contains missing or empty project IDs."
-            )
-
-        labels = pd.to_numeric(frame[config.label_column], errors="raise")
-        if not labels.isin([0, 1]).all():
-            raise ValueError(
-                f"{partition_name} labels must be binary values 0 and 1."
-            )
-        frame[config.label_column] = labels.astype("int8")
-
-        if set(frame[config.label_column].unique().tolist()) != {0, 1}:
-            raise ValueError(
-                f"{partition_name} partition must contain both label classes."
-            )
-
-    source_id_overlap = set(dev_clean[config.source_id_column]).intersection(
-        set(holdout_clean[config.source_id_column])
-    )
-    if source_id_overlap:
-        raise RuntimeError(
-            "source_row_id leakage between development and outer holdout. "
-            f"Examples: {sorted(source_id_overlap)[:10]}"
-        )
-
-    project_overlap = set(dev_clean[config.project_column]).intersection(
-        set(holdout_clean[config.project_column])
-    )
-    if project_overlap:
-        raise RuntimeError(
-            "Project leakage between development and outer holdout. "
-            f"Examples: {sorted(project_overlap)[:10]}"
-        )
-
-    return dev_clean, holdout_clean
-
 def run_exp0_final_holdout(
     dev_frame: pd.DataFrame,
     holdout_frame: pd.DataFrame,
@@ -995,11 +886,29 @@ def run_exp0_final_holdout(
     """
     _validate_config(config)
 
-    dev_clean, holdout_clean = _validate_final_holdout_partitions(
-        dev_frame=dev_frame,
-        holdout_frame=holdout_frame,
-        config=config,
-    )
+    required = [config.source_id_column, config.code_column, config.label_column, config.project_column]
+    _require_columns(dev_frame, required)
+    _require_columns(holdout_frame, required)
+
+    dev_projects = set(dev_frame[config.project_column].astype(str).str.strip())
+    holdout_projects = set(holdout_frame[config.project_column].astype(str).str.strip())
+    overlap = dev_projects & holdout_projects
+    if overlap:
+        raise RuntimeError(
+            f"Project leakage between dev and holdout: {sorted(overlap)[:10]}"
+        )
+
+    dev_clean = dev_frame.copy()
+    holdout_clean = holdout_frame.copy()
+    for frame in (dev_clean, holdout_clean):
+        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
+        labels = pd.to_numeric(frame[config.label_column], errors="raise")
+        if not labels.isin([0, 1]).all():
+            raise ValueError("label must be binary 0/1.")
+        frame[config.label_column] = labels.astype("int8")
+
+    if set(holdout_clean[config.label_column].unique().tolist()) != {0, 1}:
+        raise RuntimeError("Holdout partition does not contain both classes.")
 
     _log("Fitting FINAL EXP-0 model on the full development partition (80%)...", config.verbose)
 
@@ -1070,10 +979,6 @@ def run_exp0_final_holdout(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         safe_name = config.experiment_name.strip().lower().replace(" ", "_")
-        safe_name = "".join(
-            character if character.isalnum() or character in {"_", "-"} else "_"
-            for character in safe_name
-        )
 
         predictions_path = output_dir / f"{safe_name}_holdout_predictions.parquet"
         metrics_path = output_dir / f"{safe_name}_holdout_metrics.json"
@@ -1099,7 +1004,7 @@ def run_exp0_final_holdout(
                 default=str,
             )
 
-        from ..evaluation import plot_precision_recall_curve, plot_confusion_matrix
+        from .evaluation import plot_precision_recall_curve, plot_confusion_matrix
         plot_precision_recall_curve(
             labels=predictions_df["label"], scores=predictions_df["y_score"],
             output_path=pr_curve_path,
