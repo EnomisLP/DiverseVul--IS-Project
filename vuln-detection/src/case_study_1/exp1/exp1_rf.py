@@ -1,7 +1,7 @@
 """
 CS1-EXP1-RF: TF-IDF + TruncatedSVD + deterministic static features + Random Forest.
 
-Pipeline per outer fold
+Pipeline per inner development fold
 -----------------------
 1. Fit word and character TF-IDF only on training code.
 2. Join sparse lexical matrices.
@@ -12,7 +12,8 @@ Pipeline per outer fold
 
 Leakage controls
 ----------------
-- The fixed 5-fold project-aware manifest is reused unchanged.
+- The frozen inner 5-fold project-aware development manifest is reused unchanged.
+- The final outer holdout is not consumed by run_exp1 or run_exp1_profile_fold.
 - Word TF-IDF, character TF-IDF, and TruncatedSVD are fitted inside each
   training fold only.
 - Static features are deterministic functions of each function's own source
@@ -45,22 +46,14 @@ from scipy.sparse import hstack
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import (
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    matthews_corrcoef,
-    precision_score,
-    recall_score,
-)
 
-from .evaluation import (
+from ..evaluation import (
     EvaluationConfig,
     compute_binary_metrics,
     evaluate_oof_predictions,
     save_evaluation_artifacts,
 )
-from .split_manifest import (
+from ..split_manifest import (
     SplitConfig,
     apply_manifest,
     assert_manifest_integrity,
@@ -68,7 +61,7 @@ from .split_manifest import (
 from .static_features import FEATURE_COLUMNS
 
 
-EXP1_VERSION = "cs1-exp1-svd-static-rf-v2-oob-threshold"
+EXP1_VERSION = "cs1-exp1-svd-static-rf-v2-holdout-innercv"
 
 
 @dataclass(frozen=True)
@@ -110,7 +103,6 @@ class Exp1Config:
     svd_n_oversamples: int = 10
 
     # Random Forest configuration.
-    # Profile-driven compute budget, fixed before the official run.
     rf_n_estimators: int = 200
     rf_criterion: str = "gini"
     rf_max_depth: Optional[int] = None
@@ -118,17 +110,9 @@ class Exp1Config:
     rf_min_samples_leaf: int = 2
     rf_max_features: str = "sqrt"
     rf_bootstrap: bool = True
-    rf_max_samples: Optional[float] = 0.70
+    rf_max_samples: Optional[float] = None
     rf_class_weight: str = "balanced_subsample"
     rf_n_jobs: int = -1
-    rf_oob_score: bool = True
-
-    # Threshold is selected only from OOB predictions of each outer-fold
-    # training partition. The held-out project data never participates.
-    oob_threshold_min: float = 0.005
-    oob_threshold_max: float = 0.250
-    oob_threshold_step: float = 0.005
-    oob_threshold_objective: str = "f1"
 
     feature_importance_top_n: int = 50
     verbose: bool = True
@@ -142,9 +126,6 @@ class Exp1Artifacts:
     fold_training_csv: Path
     feature_importances_csv: Path
     static_feature_importances_csv: Path
-    oob_operating_metrics_json: Path
-    oob_operating_fold_metrics_csv: Path
-    oob_operating_fold_summary_csv: Path
     run_metadata_json: Path
     evaluation_paths: object
 
@@ -201,16 +182,6 @@ def _validate_config(config: Exp1Config) -> None:
             raise ValueError("rf_max_samples requires rf_bootstrap=True.")
         if not 0.0 < float(config.rf_max_samples) <= 1.0:
             raise ValueError("rf_max_samples must be in (0, 1] when provided.")
-    if not config.rf_oob_score:
-        raise ValueError(
-            "EXP-1 v2 requires rf_oob_score=True for training-only threshold selection."
-        )
-    if not (0.0 < config.oob_threshold_min < config.oob_threshold_max < 1.0):
-        raise ValueError("Invalid OOB threshold range.")
-    if config.oob_threshold_step <= 0.0:
-        raise ValueError("oob_threshold_step must be positive.")
-    if config.oob_threshold_objective != "f1":
-        raise ValueError("This implementation currently supports oob_threshold_objective='f1'.")
 
 
 def _validate_dataset_with_folds(
@@ -322,12 +293,14 @@ def _prepare_dataset_and_static_lookup(
     static_ids = static_lookup.index
 
     missing_static = dataset_ids.difference(static_ids)
-    unexpected_static = static_ids.difference(dataset_ids)
 
-    if len(missing_static) or len(unexpected_static):
+    if len(missing_static):
         raise ValueError(
-            "Static feature cache IDs do not exactly match the normalized dataset. "
-            f"missing={len(missing_static):,}, unexpected={len(unexpected_static):,}."
+            "Static feature cache is missing IDs required by the current "
+            "development frame. "
+            f"missing={len(missing_static):,}. "
+            "The cache may include additional IDs from the frozen outer "
+            "holdout because its features are deterministic and label-free."
         )
 
     for fold_id in range(config.n_splits):
@@ -382,6 +355,13 @@ def _build_char_vectorizer(config: Exp1Config) -> TfidfVectorizer:
     )
 
 
+
+def _fold_label(fold_id: int, config: Exp1Config) -> str:
+    """Return a clear log label for an inner-CV fold or the final holdout."""
+    if int(fold_id) < 0:
+        return "FINAL HOLDOUT"
+    return f"Fold {int(fold_id) + 1}/{config.n_splits}"
+
 def _fit_lexical_matrices(
     train_code: pd.Series,
     test_code: pd.Series,
@@ -389,7 +369,7 @@ def _fit_lexical_matrices(
     fold_id: int,
 ):
     """Fit train-only TF-IDF matrices and return joined sparse lexical features."""
-    label = f"Fold {fold_id + 1}/{config.n_splits}"
+    label = _fold_label(fold_id, config)
 
     word_vectorizer = _build_word_vectorizer(config)
     char_vectorizer = _build_char_vectorizer(config)
@@ -449,7 +429,13 @@ def _fit_lexical_matrices(
         config.verbose,
     )
 
-    return x_train_lexical, x_test_lexical, metadata
+    return (
+        x_train_lexical,
+        x_test_lexical,
+        word_vectorizer,
+        char_vectorizer,
+        metadata,
+    )
 
 
 def _fit_and_transform_svd(
@@ -466,7 +452,7 @@ def _fit_and_transform_svd(
             f"{x_train_lexical.shape[1]} lexical features."
         )
 
-    label = f"Fold {fold_id + 1}/{config.n_splits}"
+    label = _fold_label(fold_id, config)
     svd = TruncatedSVD(
         n_components=config.svd_n_components,
         algorithm=config.svd_algorithm,
@@ -494,7 +480,7 @@ def _fit_and_transform_svd(
         f"(explained variance ratio sum={explained_variance:.4f}).",
         config.verbose,
     )
-    return x_train_svd, x_test_svd, svd_seconds, explained_variance
+    return x_train_svd, x_test_svd, svd, svd_seconds, explained_variance
 
 
 def _get_static_matrix(
@@ -527,159 +513,9 @@ def _build_model(config: Exp1Config) -> RandomForestClassifier:
         max_samples=config.rf_max_samples,
         class_weight=config.rf_class_weight,
         n_jobs=config.rf_n_jobs,
-        oob_score=config.rf_oob_score,
         random_state=config.random_state,
     )
 
-
-
-def _oob_threshold_candidates(config: Exp1Config) -> np.ndarray:
-    """Return a fixed, predeclared threshold grid for OOB F1 selection."""
-    grid = np.arange(
-        config.oob_threshold_min,
-        config.oob_threshold_max + (config.oob_threshold_step / 2.0),
-        config.oob_threshold_step,
-        dtype=float,
-    )
-    return np.clip(grid, 0.0, 1.0)
-
-
-def _binary_metrics_from_decisions(
-    labels: Sequence[int] | np.ndarray | pd.Series,
-    scores: Sequence[float] | np.ndarray | pd.Series,
-    decisions: Sequence[int] | np.ndarray | pd.Series,
-    threshold: float | None,
-) -> dict:
-    """Compute ranking and operating-point metrics from supplied decisions."""
-    y_true = np.asarray(labels, dtype=np.int8)
-    y_score = np.asarray(scores, dtype=float)
-    y_pred = np.asarray(decisions, dtype=np.int8)
-
-    if len(y_true) == 0 or not (len(y_true) == len(y_score) == len(y_pred)):
-        raise ValueError("labels, scores, and decisions must be aligned and non-empty.")
-    if not np.isin(y_true, [0, 1]).all() or not np.isin(y_pred, [0, 1]).all():
-        raise ValueError("labels and decisions must be binary.")
-
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    denominator_npv = tn + fn
-    npv = float(tn / denominator_npv) if denominator_npv else 0.0
-    return {
-        "n_samples": int(len(y_true)),
-        "vulnerable_1": int((y_true == 1).sum()),
-        "non_vulnerable_0": int((y_true == 0).sum()),
-        "positive_rate": float(y_true.mean()),
-        "threshold": None if threshold is None else float(threshold),
-        "average_precision_pr_auc": float(average_precision_score(y_true, y_score)),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
-        "specificity": float(tn / (tn + fp)) if (tn + fp) else 0.0,
-        "negative_predictive_value": npv,
-        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) else 0.0,
-        "true_negative": int(tn),
-        "false_positive": int(fp),
-        "false_negative": int(fn),
-        "true_positive": int(tp),
-        "predicted_positive": int(y_pred.sum()),
-        "predicted_positive_rate": float(y_pred.mean()),
-    }
-
-
-def _select_oob_threshold(
-    labels: np.ndarray,
-    oob_scores: np.ndarray,
-    config: Exp1Config,
-) -> tuple[float, dict]:
-    """Choose a threshold from OOB train scores only, maximizing F1 on a fixed grid."""
-    valid = np.isfinite(oob_scores) & (oob_scores >= 0.0) & (oob_scores <= 1.0)
-    if valid.sum() != len(labels):
-        raise RuntimeError(
-            "OOB decision scores are incomplete. Increase tree count or inspect RF setup."
-        )
-
-    candidates = _oob_threshold_candidates(config)
-    rows = []
-    best = None
-    for threshold in candidates:
-        decisions = (oob_scores >= threshold).astype(np.int8)
-        metrics = _binary_metrics_from_decisions(
-            labels=labels,
-            scores=oob_scores,
-            decisions=decisions,
-            threshold=float(threshold),
-        )
-        rows.append(metrics)
-        # Tie-break: higher precision, then fewer alerts. This is deterministic.
-        key = (metrics["f1"], metrics["precision"], -metrics["predicted_positive"])
-        if best is None or key > best[0]:
-            best = (key, metrics)
-
-    assert best is not None
-    summary = dict(best[1])
-    summary["selection_source"] = "training_oob_predictions"
-    summary["selection_objective"] = config.oob_threshold_objective
-    summary["candidate_count"] = int(len(candidates))
-    summary["candidate_min"] = float(candidates.min())
-    summary["candidate_max"] = float(candidates.max())
-    return float(summary["threshold"]), summary
-
-
-def _evaluate_foldwise_oob_thresholds(predictions: pd.DataFrame) -> dict:
-    """Evaluate decisions generated with per-fold OOB-selected thresholds."""
-    required = {"fold", "label", "y_score", "y_pred_oob_threshold", "selected_oob_threshold"}
-    missing = required.difference(predictions.columns)
-    if missing:
-        raise KeyError(f"Missing OOB operating-point columns: {sorted(missing)}")
-
-    fold_rows = []
-    for fold_id, group in predictions.groupby("fold", sort=True):
-        metric = _binary_metrics_from_decisions(
-            labels=group["label"],
-            scores=group["y_score"],
-            decisions=group["y_pred_oob_threshold"],
-            threshold=float(group["selected_oob_threshold"].iloc[0]),
-        )
-        metric["fold"] = int(fold_id)
-        metric["test_unique_projects"] = int(group["project"].nunique())
-        fold_rows.append(metric)
-
-    fold_metrics = pd.DataFrame(fold_rows).sort_values("fold").reset_index(drop=True)
-    pooled_metrics = _binary_metrics_from_decisions(
-        labels=predictions["label"],
-        scores=predictions["y_score"],
-        decisions=predictions["y_pred_oob_threshold"],
-        threshold=None,
-    )
-    pooled_metrics["threshold_strategy"] = "per_fold_training_oob_f1"
-    pooled_metrics["selected_threshold_min"] = float(predictions["selected_oob_threshold"].min())
-    pooled_metrics["selected_threshold_max"] = float(predictions["selected_oob_threshold"].max())
-    pooled_metrics["selected_threshold_mean"] = float(predictions["selected_oob_threshold"].mean())
-
-    summary_rows = []
-    metric_columns = [
-        "average_precision_pr_auc", "precision", "recall", "f1", "mcc",
-        "false_positive_rate", "predicted_positive_rate", "threshold",
-    ]
-    for column in metric_columns:
-        series = fold_metrics[column].astype(float)
-        summary_rows.append({
-            "metric": column,
-            "mean": float(series.mean()),
-            "std": float(series.std(ddof=1)),
-            "min": float(series.min()),
-            "max": float(series.max()),
-        })
-    return {
-        "pooled_metrics": pooled_metrics,
-        "fold_metrics": fold_metrics,
-        "fold_summary": pd.DataFrame(summary_rows),
-    }
 
 def _feature_importance_frame(
     model: RandomForestClassifier,
@@ -728,7 +564,7 @@ def _run_single_fold(
     config: Exp1Config,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Fit one EXP-1 fold and return held-out predictions, importances, and timing."""
-    label = f"Fold {fold_id + 1}/{config.n_splits}"
+    label = _fold_label(fold_id, config)
     started = time.perf_counter()
 
     _log(
@@ -738,20 +574,30 @@ def _run_single_fold(
         config.verbose,
     )
 
-    x_train_lexical, x_test_lexical, lexical_metadata = _fit_lexical_matrices(
+    (
+        x_train_lexical,
+        x_test_lexical,
+        word_vectorizer,
+        char_vectorizer,
+        lexical_metadata,
+    ) = _fit_lexical_matrices(
         train_code=train_frame[config.code_column],
         test_code=test_frame[config.code_column],
         config=config,
         fold_id=fold_id,
     )
 
-    x_train_svd, x_test_svd, svd_seconds, svd_variance_ratio = (
-        _fit_and_transform_svd(
-            x_train_lexical=x_train_lexical,
-            x_test_lexical=x_test_lexical,
-            config=config,
-            fold_id=fold_id,
-        )
+    (
+        x_train_svd,
+        x_test_svd,
+        svd,
+        svd_seconds,
+        svd_variance_ratio,
+    ) = _fit_and_transform_svd(
+        x_train_lexical=x_train_lexical,
+        x_test_lexical=x_test_lexical,
+        config=config,
+        fold_id=fold_id,
     )
 
     _log(f"{label} | loading cached static features...", config.verbose)
@@ -804,38 +650,12 @@ def _run_single_fold(
         config.verbose,
     )
 
+    _log(f"{label} | scoring held-out projects...", config.verbose)
+    prediction_start = time.perf_counter()
     positive_index = np.where(model.classes_ == 1)[0]
     if len(positive_index) != 1:
         raise RuntimeError("Random Forest does not expose positive class label 1.")
-    positive_index = int(positive_index[0])
-
-    _log(
-        f"{label} | selecting threshold from training-only OOB predictions...",
-        config.verbose,
-    )
-    oob_start = time.perf_counter()
-    if not hasattr(model, "oob_decision_function_"):
-        raise RuntimeError("RF OOB predictions are unavailable; set rf_oob_score=True.")
-    oob_scores = np.asarray(
-        model.oob_decision_function_[:, positive_index],
-        dtype=np.float64,
-    )
-    selected_threshold, oob_threshold_metrics = _select_oob_threshold(
-        labels=y_train,
-        oob_scores=oob_scores,
-        config=config,
-    )
-    oob_selection_seconds = float(time.perf_counter() - oob_start)
-    _log(
-        f"{label} | OOB F1 threshold={selected_threshold:.3f} "
-        f"(OOB F1={oob_threshold_metrics['f1']:.4f}).",
-        config.verbose,
-    )
-
-    _log(f"{label} | scoring held-out projects...", config.verbose)
-    prediction_start = time.perf_counter()
-    y_score = model.predict_proba(x_test)[:, positive_index]
-    y_pred_oob_threshold = (y_score >= selected_threshold).astype(np.int8)
+    y_score = model.predict_proba(x_test)[:, int(positive_index[0])]
     prediction_seconds = float(time.perf_counter() - prediction_start)
 
     predictions = test_frame[
@@ -854,8 +674,6 @@ def _run_single_fold(
         }
     )
     predictions["y_score"] = y_score.astype(np.float64)
-    predictions["selected_oob_threshold"] = float(selected_threshold)
-    predictions["y_pred_oob_threshold"] = y_pred_oob_threshold.astype(np.int8)
 
     importances = _feature_importance_frame(
         model=model,
@@ -883,13 +701,6 @@ def _run_single_fold(
         "dense_feature_concatenation_seconds": float(concatenate_seconds),
         "final_dense_features": int(expected_dense_features),
         "model_fit_seconds": float(model_fit_seconds),
-        "oob_threshold_selection_seconds": float(oob_selection_seconds),
-        "selected_oob_threshold": float(selected_threshold),
-        "oob_average_precision_pr_auc": float(oob_threshold_metrics["average_precision_pr_auc"]),
-        "oob_precision": float(oob_threshold_metrics["precision"]),
-        "oob_recall": float(oob_threshold_metrics["recall"]),
-        "oob_f1": float(oob_threshold_metrics["f1"]),
-        "oob_mcc": float(oob_threshold_metrics["mcc"]),
         "prediction_seconds": float(prediction_seconds),
         "total_fold_seconds": float(total_seconds),
         "optimizer": "RandomForestClassifier",
@@ -912,6 +723,9 @@ def _run_single_fold(
         x_test_static,
         x_train,
         x_test,
+        word_vectorizer,
+        char_vectorizer,
+        svd,
         model,
     )
     gc.collect()
@@ -929,9 +743,8 @@ def run_exp1_profile_fold(
     """
     Run one fold only for computational feasibility validation.
 
-    The returned thresholded metrics use a threshold selected solely from
-    training-partition OOB predictions. They remain descriptive for one outer
-    fold and are not the official five-fold EXP-1 result.
+    The returned metrics are descriptive for a single fold. They are not the
+    official EXP-1 result and must not be used to tune the configuration.
     """
     _validate_config(config)
     if fold_id not in range(config.n_splits):
@@ -966,15 +779,7 @@ def run_exp1_profile_fold(
         config=config,
     )
 
-    selected_threshold = float(predictions["selected_oob_threshold"].iloc[0])
-    metrics = _binary_metrics_from_decisions(
-        labels=predictions["label"],
-        scores=predictions["y_score"],
-        decisions=predictions["y_pred_oob_threshold"],
-        threshold=selected_threshold,
-    )
-    metrics["threshold_strategy"] = "training_oob_f1"
-    default_threshold_metrics = compute_binary_metrics(
+    metrics = compute_binary_metrics(
         labels=predictions["label"],
         scores=predictions["y_score"],
         threshold=config.decision_threshold,
@@ -995,7 +800,6 @@ def run_exp1_profile_fold(
         "feature_importances": importances,
         "training_metadata": pd.DataFrame([metadata]),
         "profile_metrics": metrics,
-        "default_threshold_metrics": default_threshold_metrics,
     }
 
 
@@ -1012,7 +816,6 @@ def _save_exp1_artifacts(
     fold_training = results["fold_training"]
     feature_importances = results["feature_importances"]
     evaluation = results["evaluation"]
-    oob_operating_evaluation = results["oob_operating_evaluation"]
 
     if not isinstance(oof_predictions, pd.DataFrame):
         raise TypeError("oof_predictions must be a DataFrame.")
@@ -1022,8 +825,6 @@ def _save_exp1_artifacts(
         raise TypeError("feature_importances must be a DataFrame.")
     if not isinstance(evaluation, Mapping):
         raise TypeError("evaluation must be a mapping.")
-    if not isinstance(oob_operating_evaluation, Mapping):
-        raise TypeError("oob_operating_evaluation must be a mapping.")
 
     safe_name = "".join(
         char if char.isalnum() or char in {"_", "-"} else "_"
@@ -1035,15 +836,6 @@ def _save_exp1_artifacts(
     feature_importances_csv = output_dir / f"{safe_name}_feature_importances.csv"
     static_feature_importances_csv = (
         output_dir / f"{safe_name}_static_feature_importances.csv"
-    )
-    oob_operating_metrics_json = (
-        output_dir / f"{safe_name}_oob_operating_pooled_metrics.json"
-    )
-    oob_operating_fold_metrics_csv = (
-        output_dir / f"{safe_name}_oob_operating_fold_metrics.csv"
-    )
-    oob_operating_fold_summary_csv = (
-        output_dir / f"{safe_name}_oob_operating_fold_summary.csv"
     )
     run_metadata_json = output_dir / f"{safe_name}_run_metadata.json"
 
@@ -1065,17 +857,6 @@ def _save_exp1_artifacts(
         .reset_index(drop=True)
     )
     static_importances.to_csv(static_feature_importances_csv, index=False)
-
-    with oob_operating_metrics_json.open("w", encoding="utf-8") as file:
-        json.dump(oob_operating_evaluation["pooled_metrics"], file, indent=2)
-    oob_operating_evaluation["fold_metrics"].to_csv(
-        oob_operating_fold_metrics_csv,
-        index=False,
-    )
-    oob_operating_evaluation["fold_summary"].to_csv(
-        oob_operating_fold_summary_csv,
-        index=False,
-    )
 
     evaluation_paths = save_evaluation_artifacts(
         evaluation=evaluation,
@@ -1101,10 +882,6 @@ def _save_exp1_artifacts(
             "score_interpretation": (
                 "Random Forest positive-class score; not a calibrated "
                 "real-world vulnerability probability."
-            ),
-            "operating_threshold_strategy": (
-                "Per-fold threshold selected by maximum F1 on training-only "
-                "out-of-bag predictions over a fixed grid from 0.005 to 0.250."
             ),
             "importance_note": (
                 "Random Forest impurity importances are descriptive diagnostics, "
@@ -1146,9 +923,6 @@ def _save_exp1_artifacts(
         fold_training_csv=fold_training_csv,
         feature_importances_csv=feature_importances_csv,
         static_feature_importances_csv=static_feature_importances_csv,
-        oob_operating_metrics_json=oob_operating_metrics_json,
-        oob_operating_fold_metrics_csv=oob_operating_fold_metrics_csv,
-        oob_operating_fold_summary_csv=oob_operating_fold_summary_csv,
         run_metadata_json=run_metadata_json,
         evaluation_paths=evaluation_paths,
     )
@@ -1163,7 +937,7 @@ def run_exp1(
     additional_metadata: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """
-    Run the official five-fold project-aware CS1-EXP1-RF experiment.
+    Run the official five-fold project-aware development-CV CS1-EXP1-RF experiment.
 
     Run ``run_exp1_profile_fold`` first after adding this module to Colab.
     """
@@ -1239,18 +1013,12 @@ def run_exp1(
     if oof_predictions["source_row_id"].duplicated().any():
         raise RuntimeError("Duplicate source_row_id detected in OOF predictions.")
 
-    # This standard evaluation retains PR curves and a fixed 0.50 diagnostic.
-    # EXP-1's primary thresholded operating metrics are stored separately below,
-    # using per-fold thresholds selected only from training OOB predictions.
     evaluation = evaluate_oof_predictions(
         oof_predictions,
         config=EvaluationConfig(
             threshold=config.decision_threshold,
             expected_n_folds=config.n_splits,
         ),
-    )
-    oob_operating_evaluation = _evaluate_foldwise_oob_thresholds(
-        oof_predictions
     )
 
     total_runtime_seconds = float(time.perf_counter() - run_started)
@@ -1264,7 +1032,6 @@ def run_exp1(
         "feature_importances": feature_importances,
         "fold_training": fold_training,
         "evaluation": evaluation,
-        "oob_operating_evaluation": oob_operating_evaluation,
         "total_runtime_seconds": total_runtime_seconds,
     }
 
@@ -1280,140 +1047,309 @@ def run_exp1(
     return results
 
 
+def _validate_final_holdout_partitions(
+    dev_frame: pd.DataFrame,
+    holdout_frame: pd.DataFrame,
+    config: Exp1Config,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Validate frozen development and outer-holdout partitions before one-time
+    final evaluation. This function deliberately does not use fold assignments.
+    """
+    required = [
+        config.source_id_column,
+        config.code_column,
+        config.label_column,
+        config.project_column,
+    ]
+    _require_columns(dev_frame, required)
+    _require_columns(holdout_frame, required)
+
+    dev_clean = dev_frame.copy()
+    holdout_clean = holdout_frame.copy()
+
+    for partition_name, frame in (
+        ("development", dev_clean),
+        ("outer holdout", holdout_clean),
+    ):
+        if frame.empty:
+            raise ValueError(f"{partition_name} partition is empty.")
+
+        if frame[config.source_id_column].isna().any():
+            raise ValueError(
+                f"{partition_name} partition has missing source_row_id values."
+            )
+        if frame[config.source_id_column].duplicated().any():
+            raise ValueError(
+                f"{partition_name} partition has duplicate source_row_id values."
+            )
+
+        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
+        empty_code = frame[config.code_column].str.strip().eq("")
+        if empty_code.any():
+            raise ValueError(
+                f"{partition_name} partition has {int(empty_code.sum()):,} "
+                f"empty {config.code_column} value(s)."
+            )
+
+        frame[config.project_column] = (
+            frame[config.project_column].fillna("").astype(str).str.strip()
+        )
+        if frame[config.project_column].eq("").any():
+            raise ValueError(
+                f"{partition_name} partition has missing or empty project IDs."
+            )
+
+        labels = pd.to_numeric(frame[config.label_column], errors="raise")
+        if not labels.isin([0, 1]).all():
+            raise ValueError(
+                f"{partition_name} partition labels must be binary 0 and 1."
+            )
+        frame[config.label_column] = labels.astype("int8")
+
+        if set(frame[config.label_column].unique().tolist()) != {0, 1}:
+            raise ValueError(
+                f"{partition_name} partition must contain both label classes."
+            )
+
+    source_id_overlap = set(dev_clean[config.source_id_column]).intersection(
+        set(holdout_clean[config.source_id_column])
+    )
+    if source_id_overlap:
+        raise RuntimeError(
+            "source_row_id leakage between development and outer holdout. "
+            f"Examples: {sorted(source_id_overlap)[:10]}"
+        )
+
+    project_overlap = set(dev_clean[config.project_column]).intersection(
+        set(holdout_clean[config.project_column]
+        )
+    )
+    if project_overlap:
+        raise RuntimeError(
+            "Project leakage between development and outer holdout. "
+            f"Examples: {sorted(project_overlap)[:10]}"
+        )
+
+    return dev_clean, holdout_clean
+
+
 def run_exp1_final_holdout(
     dev_frame: pd.DataFrame,
-    static_features_frame: pd.DataFrame,
     holdout_frame: pd.DataFrame,
+    static_features_frame: pd.DataFrame,
     config: Exp1Config = Exp1Config(),
     output_dir: Optional[Path | str] = None,
     additional_metadata: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """
-    Fit ONE final EXP-1 model on the ENTIRE development partition (80%),
-    select the operating threshold from that same fit's training-only OOB
-    predictions, then score the untouched 20% holdout exactly once.
+    Fit one final EXP-1 model on all development projects and score the frozen,
+    project-disjoint outer holdout exactly once.
+
+    Call this only after final candidate selection is recorded using
+    development-only inner-CV evidence.
     """
     _validate_config(config)
 
-    required = [config.source_id_column, config.code_column, config.label_column, config.project_column]
-    _require_columns(dev_frame, required)
-    _require_columns(holdout_frame, required)
+    dev_clean, holdout_clean = _validate_final_holdout_partitions(
+        dev_frame=dev_frame,
+        holdout_frame=holdout_frame,
+        config=config,
+    )
+    static_lookup = _validate_static_feature_frame(
+        static_features_frame,
+        config=config,
+    )
 
-    dev_projects = set(dev_frame[config.project_column].astype(str).str.strip())
-    holdout_projects = set(holdout_frame[config.project_column].astype(str).str.strip())
-    overlap = dev_projects & holdout_projects
-    if overlap:
-        raise RuntimeError(f"Project leakage between dev and holdout: {sorted(overlap)[:10]}")
+    required_static_ids = pd.Index(
+        pd.concat(
+            [
+                dev_clean[config.source_id_column],
+                holdout_clean[config.source_id_column],
+            ],
+            ignore_index=True,
+        )
+    )
+    missing_static = required_static_ids.difference(static_lookup.index)
+    if len(missing_static):
+        raise ValueError(
+            "Static feature cache is missing final-evaluation IDs: "
+            f"{len(missing_static):,}."
+        )
 
-    dev_clean = dev_frame.copy()
-    holdout_clean = holdout_frame.copy()
-    for frame in (dev_clean, holdout_clean):
-        frame[config.code_column] = frame[config.code_column].fillna("").astype(str)
-        labels = pd.to_numeric(frame[config.label_column], errors="raise")
-        if not labels.isin([0, 1]).all():
-            raise ValueError("label must be binary 0/1.")
-        frame[config.label_column] = labels.astype("int8")
+    _log(
+        "Fitting FINAL EXP-1 model on the full development partition...",
+        config.verbose,
+    )
 
-    static_lookup = _validate_static_feature_frame(static_features_frame, config)
-
-    _log("Fitting FINAL EXP-1 lexical representation on full dev (80%)...", config.verbose)
-    x_dev_lexical, x_holdout_lexical, lexical_metadata = _fit_lexical_matrices(
+    (
+        x_dev_lexical,
+        x_holdout_lexical,
+        word_vectorizer,
+        char_vectorizer,
+        lexical_metadata,
+    ) = _fit_lexical_matrices(
         train_code=dev_clean[config.code_column],
         test_code=holdout_clean[config.code_column],
         config=config,
         fold_id=-1,
     )
-    x_dev_svd, x_holdout_svd, svd_seconds, svd_variance_ratio = _fit_and_transform_svd(
+
+    (
+        x_dev_svd,
+        x_holdout_svd,
+        svd,
+        svd_seconds,
+        svd_variance_ratio,
+    ) = _fit_and_transform_svd(
         x_train_lexical=x_dev_lexical,
         x_test_lexical=x_holdout_lexical,
         config=config,
         fold_id=-1,
     )
 
-    x_dev_static = _get_static_matrix(static_lookup, dev_clean[config.source_id_column], config)
-    x_holdout_static = _get_static_matrix(static_lookup, holdout_clean[config.source_id_column], config)
+    static_start = time.perf_counter()
+    x_dev_static = _get_static_matrix(
+        static_lookup,
+        dev_clean[config.source_id_column],
+        config,
+    )
+    x_holdout_static = _get_static_matrix(
+        static_lookup,
+        holdout_clean[config.source_id_column],
+        config,
+    )
+    static_lookup_seconds = float(time.perf_counter() - static_start)
 
+    concatenate_start = time.perf_counter()
     x_dev = np.hstack([x_dev_svd, x_dev_static]).astype(np.float32, copy=False)
-    x_holdout = np.hstack([x_holdout_svd, x_holdout_static]).astype(np.float32, copy=False)
+    x_holdout = np.hstack(
+        [x_holdout_svd, x_holdout_static]
+    ).astype(np.float32, copy=False)
+    dense_feature_concatenation_seconds = float(
+        time.perf_counter() - concatenate_start
+    )
+
+    expected_dense_features = config.svd_n_components + len(FEATURE_COLUMNS)
+    if x_dev.shape[1] != expected_dense_features:
+        raise RuntimeError(
+            f"Expected {expected_dense_features} final dense features; "
+            f"received {x_dev.shape[1]}."
+        )
 
     y_dev = dev_clean[config.label_column].to_numpy(dtype=np.int8)
+    y_holdout = holdout_clean[config.label_column].to_numpy(dtype=np.int8)
     model = _build_model(config)
 
-    _log("Fitting FINAL EXP-1 Random Forest on full dev (80%)...", config.verbose)
+    _log(
+        f"FINAL HOLDOUT | training Random Forest "
+        f"(trees={config.rf_n_estimators}, "
+        f"class_weight={config.rf_class_weight})...",
+        config.verbose,
+    )
     fit_start = time.perf_counter()
     model.fit(x_dev, y_dev)
     fit_seconds = float(time.perf_counter() - fit_start)
 
+    _log(
+        "FINAL HOLDOUT | scoring the untouched outer holdout exactly once...",
+        config.verbose,
+    )
+    prediction_start = time.perf_counter()
     positive_index = np.where(model.classes_ == 1)[0]
     if len(positive_index) != 1:
         raise RuntimeError("Random Forest does not expose positive class label 1.")
-    positive_index = int(positive_index[0])
+    y_score = model.predict_proba(x_holdout)[:, int(positive_index[0])]
+    prediction_seconds = float(time.perf_counter() - prediction_start)
 
-    if not hasattr(model, "oob_decision_function_"):
-        raise RuntimeError("RF OOB predictions are unavailable; set rf_oob_score=True.")
-    oob_scores = np.asarray(model.oob_decision_function_[:, positive_index], dtype=np.float64)
-    selected_threshold, oob_threshold_metrics = _select_oob_threshold(
-        labels=y_dev, oob_scores=oob_scores, config=config,
+    metrics = compute_binary_metrics(
+        labels=y_holdout,
+        scores=y_score,
+        threshold=config.decision_threshold,
     )
-    _log(
-        f"FINAL EXP-1 threshold selected from full-dev OOB: {selected_threshold:.3f} "
-        f"(OOB F1={oob_threshold_metrics['f1']:.4f}).",
-        config.verbose,
-    )
-
-    _log("Scoring the EXP-1 HOLDOUT partition exactly once...", config.verbose)
-    y_holdout = holdout_clean[config.label_column].to_numpy(dtype=np.int8)
-    y_score = model.predict_proba(x_holdout)[:, positive_index]
-    y_pred = (y_score >= selected_threshold).astype(np.int8)
-
-    metrics = _binary_metrics_from_decisions(
-        labels=y_holdout, scores=y_score, decisions=y_pred, threshold=selected_threshold,
-    )
-    metrics["threshold_strategy"] = "full_dev_training_oob_f1"
 
     predictions_df = pd.DataFrame(
         {
             "source_row_id": holdout_clean[config.source_id_column].to_numpy(),
             "label": y_holdout,
             "project": holdout_clean[config.project_column].to_numpy(),
-            "y_score": y_score,
-            "selected_oob_threshold": float(selected_threshold),
-            "y_pred": y_pred,
+            "y_score": y_score.astype(np.float64),
+            "y_pred": (
+                y_score >= config.decision_threshold
+            ).astype(np.int8),
         }
     )
 
-    importances = _feature_importance_frame(model=model, fold_id=-1, config=config)
+    feature_importances = _feature_importance_frame(
+        model=model,
+        fold_id=-1,
+        config=config,
+    )
+
+    vector_metadata = {
+        **lexical_metadata,
+        "svd_components": int(config.svd_n_components),
+        "svd_seconds": float(svd_seconds),
+        "svd_explained_variance_ratio_sum": float(svd_variance_ratio),
+        "static_features": int(len(FEATURE_COLUMNS)),
+        "static_lookup_seconds": float(static_lookup_seconds),
+        "dense_feature_concatenation_seconds": float(
+            dense_feature_concatenation_seconds
+        ),
+        "final_dense_features": int(expected_dense_features),
+    }
 
     results = {
-        "experiment": "cs1_exp1_rf",
+        "experiment": config.experiment_name,
         "model": model,
+        "word_vectorizer": word_vectorizer,
+        "char_vectorizer": char_vectorizer,
+        "svd": svd,
         "predictions": predictions_df,
         "metrics": metrics,
-        "oob_threshold_metrics": oob_threshold_metrics,
-        "feature_importances": importances,
+        "feature_importances": feature_importances,
+        "vector_metadata": vector_metadata,
         "fit_seconds": fit_seconds,
-        "svd_explained_variance_ratio_sum": svd_variance_ratio,
+        "prediction_seconds": prediction_seconds,
     }
 
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = config.experiment_name.strip().lower().replace(" ", "_")
+
+        safe_name = "".join(
+            character if character.isalnum() or character in {"_", "-"} else "_"
+            for character in config.experiment_name.strip().lower().replace(" ", "_")
+        )
 
         predictions_path = output_dir / f"{safe_name}_holdout_predictions.parquet"
         metrics_path = output_dir / f"{safe_name}_holdout_metrics.json"
-        importances_path = output_dir / f"{safe_name}_holdout_feature_importances.csv"
+        importances_path = (
+            output_dir / f"{safe_name}_holdout_feature_importances.csv"
+        )
+        static_importances_path = (
+            output_dir / f"{safe_name}_holdout_static_feature_importances.csv"
+        )
+        pr_curve_path = (
+            output_dir / f"{safe_name}_holdout_precision_recall_curve.png"
+        )
+        cm_path = output_dir / f"{safe_name}_holdout_confusion_matrix.png"
 
         predictions_df.to_parquet(predictions_path, index=False)
-        importances.to_csv(importances_path, index=False)
+        feature_importances.to_csv(importances_path, index=False)
+        feature_importances.loc[
+            feature_importances["feature_group"] == "static"
+        ].to_csv(static_importances_path, index=False)
+
         with metrics_path.open("w", encoding="utf-8") as file:
             json.dump(
                 {
                     "exp1_version": EXP1_VERSION,
                     "config": asdict(config),
                     "metrics": metrics,
-                    "oob_threshold_metrics": oob_threshold_metrics,
                     "fit_seconds": fit_seconds,
+                    "prediction_seconds": prediction_seconds,
+                    "vector_metadata": vector_metadata,
                     "n_dev_rows": int(len(dev_clean)),
                     "n_holdout_rows": int(len(holdout_clean)),
                     "additional_metadata": dict(additional_metadata or {}),
@@ -1422,12 +1358,43 @@ def run_exp1_final_holdout(
                 indent=2,
                 default=str,
             )
+
+        from ..evaluation import (
+            plot_confusion_matrix,
+            plot_precision_recall_curve,
+        )
+
+        plot_precision_recall_curve(
+            labels=predictions_df["label"],
+            scores=predictions_df["y_score"],
+            output_path=pr_curve_path,
+            title=(
+                f"{config.experiment_name}: FINAL Holdout "
+                "Precision-Recall Curve"
+            ),
+        )
+        plot_confusion_matrix(
+            labels=predictions_df["label"],
+            predictions=predictions_df["y_pred"],
+            output_path=cm_path,
+            title=(
+                f"{config.experiment_name}: FINAL Holdout "
+                "Confusion Matrix"
+            ),
+        )
+
         results["artifact_paths"] = {
             "predictions": predictions_path,
             "metrics": metrics_path,
             "feature_importances": importances_path,
+            "static_feature_importances": static_importances_path,
+            "pr_curve": pr_curve_path,
+            "confusion_matrix": cm_path,
         }
-        _log(f"EXP-1 holdout artifacts saved to: {output_dir}", config.verbose)
+        _log(
+            f"EXP-1 final-holdout artifacts saved to: {output_dir}",
+            config.verbose,
+        )
 
     return results
 

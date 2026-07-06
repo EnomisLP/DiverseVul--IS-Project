@@ -1,0 +1,58 @@
+# CS1-EXP1-RF: frozen configuration for development-only grouped CV
+experiment_name: cs1_exp1_rf_inner_dev_grouped
+evaluation_protocol:
+  outer_holdout: frozen_project_disjoint_approximately_20_percent
+  inner_cv: frozen_5_fold_stratified_group_k_fold_on_development_projects
+  candidate_selection_metric: average_precision_pr_auc
+  final_outer_holdout: locked_until_candidate_selection_is_complete
+
+data:
+  code_column: normalized_code
+  static_feature_code_column: code
+  source_id_column: source_row_id
+  label_column: label
+  project_column: project
+  fold_column: fold
+
+reproducibility:
+  n_splits: 5
+  model_random_state: 42
+  decision_threshold: 0.50
+
+lexical_tfidf:
+  word_ngram_range: [1, 3]
+  word_min_df: 3
+  word_max_df: 0.995
+  word_max_features: 50000
+  char_analyzer: char
+  char_ngram_range: [3, 4]
+  char_min_df: 8
+  char_max_df: 0.995
+  char_max_features: 60000
+  lowercase: false
+  sublinear_tf: true
+  norm: l2
+
+svd:
+  n_components: 256
+  algorithm: randomized
+  n_iter: 5
+  n_oversamples: 10
+
+random_forest:
+  n_estimators: 200
+  criterion: gini
+  max_depth: null
+  min_samples_split: 2
+  min_samples_leaf: 2
+  max_features: sqrt
+  bootstrap: true
+  max_samples: null
+  class_weight: balanced_subsample
+  n_jobs: -1
+
+static_features:
+  version: cs1-static-features-v1
+  feature_count: 54
+  extraction_scope: full_normalized_dataset_label_free
+  cache_can_include_outer_holdout_rows: true
