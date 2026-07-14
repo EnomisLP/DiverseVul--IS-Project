@@ -1,114 +1,70 @@
-"""Shared data utilities for Case Study 2 experiments.
+"""
+Shared data loading utilities for Case Study 2.
 
-This module is intentionally experiment-neutral.  It should be imported by
-EXP-3 (linear probe), EXP-4 (LoRA), and EXP-5 (HEFT/ReFT) so that all
-transformer-based experiments use the same data conventions.
-
-The utilities here do not decide which experiment to run.  They only handle:
-- safe code/label dataframe preparation,
-- PyTorch dataset/dataloader creation,
-- dynamic tokenizer padding,
-- class-weight computation,
-- simple reproducible sampling for smoke/pilot runs,
-- project-aware threshold splits.
+This module is reusable by EXP-3, EXP-4, and EXP-5.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
-from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import Dataset, DataLoader
 
 
 EMPTY_CODE_SENTINEL = "EMPTY_CODE_SAMPLE"
 
 
-@dataclass(frozen=True)
-class DatasetColumns:
-    """Column names used across CS2 experiments."""
-
-    code: str = "normalized_code"
-    label: str = "label"
-    source_id: str = "source_row_id"
-    project: str = "project"
-
-
-def validate_required_columns(frame: pd.DataFrame, columns: DatasetColumns) -> None:
-    """Raise a clear error if expected dataframe columns are missing."""
-
-    required = [columns.code, columns.label, columns.source_id, columns.project]
-    missing = [name for name in required if name not in frame.columns]
-    if missing:
-        raise KeyError(
-            "Missing required dataframe columns: "
-            + ", ".join(missing)
-            + f"\nAvailable columns: {list(frame.columns)}"
-        )
-
-
-def prepare_code_frame(frame: pd.DataFrame, columns: DatasetColumns) -> pd.DataFrame:
-    """Return a safe copy with string code and integer labels.
-
-    Empty code strings are replaced with a deterministic sentinel so tokenizer
-    calls never receive an empty string.  This is the same idea used in CS1 for
-    the one empty identifier-abstraction row, but the helper remains generic.
-    """
-
-    validate_required_columns(frame, columns)
-    out = frame.copy().reset_index(drop=True)
-    out[columns.code] = out[columns.code].fillna("").astype(str)
-    empty_mask = out[columns.code].str.strip().eq("")
-    if empty_mask.any():
-        out.loc[empty_mask, columns.code] = EMPTY_CODE_SENTINEL
-    out[columns.label] = out[columns.label].astype(int)
-    return out
-
-
 class CodeTextDataset(Dataset):
-    """Dataset returning raw code text plus labels/metadata.
-
-    Tokenization is intentionally performed in the collator, not in
-    ``__getitem__``.  This allows dynamic padding and avoids duplicating token
-    padding logic across EXP-3/EXP-4/EXP-5.
+    """
+    Dataset that stores raw code text and labels.
+    Tokenization is handled by TransformerBatchCollator for dynamic padding.
     """
 
-    def __init__(self, frame: pd.DataFrame, columns: DatasetColumns):
-        self.columns = columns
-        self.frame = prepare_code_frame(frame, columns)
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        code_column: str = "normalized_code",
+        label_column: str = "label",
+        source_id_column: str = "source_row_id",
+        project_column: str = "project",
+    ) -> None:
+        self.df = dataframe.copy().reset_index(drop=True)
+        self.code_column = code_column
+        self.label_column = label_column
+        self.source_id_column = source_id_column
+        self.project_column = project_column
+
+        self.df[self.code_column] = self.df[self.code_column].fillna("").astype(str)
+        empty_mask = self.df[self.code_column].str.strip().eq("")
+        if empty_mask.any():
+            self.df.loc[empty_mask, self.code_column] = EMPTY_CODE_SENTINEL
 
     def __len__(self) -> int:
-        return len(self.frame)
+        return int(len(self.df))
 
-    def __getitem__(self, idx: int) -> Dict[str, object]:
-        row = self.frame.iloc[idx]
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        row = self.df.iloc[idx]
         return {
-            "code": row[self.columns.code],
-            "label": int(row[self.columns.label]),
-            "source_row_id": int(row[self.columns.source_id]),
-            "project": str(row[self.columns.project]),
+            "code": str(row[self.code_column]),
+            "label": int(row[self.label_column]),
+            "source_row_id": int(row[self.source_id_column]),
+            "project": str(row[self.project_column]),
         }
 
 
+@dataclass
 class TransformerBatchCollator:
-    """Batch tokenizer/collator shared by all CS2 transformer experiments."""
+    tokenizer: Any
+    max_length: int = 512
+    pad_to_multiple_of: Optional[int] = 8
 
-    def __init__(self, tokenizer, max_length: int = 512, pad_to_multiple_of: Optional[int] = 8):
-        self.tokenizer = tokenizer
-        self.max_length = int(max_length)
-        self.pad_to_multiple_of = pad_to_multiple_of
-
-    def __call__(self, examples: Sequence[Dict[str, object]]) -> Dict[str, object]:
-        texts = [str(item["code"]) for item in examples]
-        labels = torch.tensor([int(item["label"]) for item in examples], dtype=torch.long)
-        source_row_ids = torch.tensor([int(item["source_row_id"]) for item in examples], dtype=torch.long)
-        projects = [str(item["project"]) for item in examples]
-
-        tokenized = self.tokenizer(
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        texts = [feature["code"] for feature in features]
+        enc = self.tokenizer(
             texts,
             truncation=True,
             max_length=self.max_length,
@@ -116,141 +72,146 @@ class TransformerBatchCollator:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
         )
-        tokenized["labels"] = labels
-        tokenized["source_row_id"] = source_row_ids
-        tokenized["project"] = projects
-        return tokenized
+
+        labels = torch.tensor([feature["label"] for feature in features], dtype=torch.float32)
+        source_row_ids = torch.tensor([feature["source_row_id"] for feature in features], dtype=torch.long)
+        projects = [feature["project"] for feature in features]
+
+        enc["labels"] = labels
+        enc["label"] = labels  # backwards compatibility with old scripts
+        enc["source_row_id"] = source_row_ids
+        enc["project"] = projects
+        return enc
 
 
 def create_dataloader(
-    frame: pd.DataFrame,
-    tokenizer,
-    *,
-    columns: DatasetColumns,
-    batch_size: int = 8,
+    dataframe: pd.DataFrame,
+    tokenizer: Any,
+    batch_size: int = 16,
     max_length: int = 512,
     shuffle: bool = False,
+    code_column: str = "normalized_code",
+    label_column: str = "label",
+    source_id_column: str = "source_row_id",
+    project_column: str = "project",
     num_workers: int = 0,
-    pin_memory: bool = True,
-    pad_to_multiple_of: Optional[int] = 8,
 ) -> DataLoader:
-    """Create a shared CS2 DataLoader with dynamic padding."""
-
-    dataset = CodeTextDataset(frame, columns)
+    dataset = CodeTextDataset(
+        dataframe=dataframe,
+        code_column=code_column,
+        label_column=label_column,
+        source_id_column=source_id_column,
+        project_column=project_column,
+    )
     collator = TransformerBatchCollator(
         tokenizer=tokenizer,
         max_length=max_length,
-        pad_to_multiple_of=pad_to_multiple_of,
+        pad_to_multiple_of=8 if torch.cuda.is_available() else None,
     )
     return DataLoader(
         dataset,
-        batch_size=int(batch_size),
-        shuffle=bool(shuffle),
-        num_workers=int(num_workers),
-        pin_memory=bool(pin_memory),
-        collate_fn=collator,
+        batch_size=batch_size,
+        shuffle=shuffle,
         drop_last=False,
+        num_workers=num_workers,
+        collate_fn=collator,
     )
 
 
-def get_pos_weight(frame: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
-    """Return BCEWithLogits positive-class weight: negatives / positives."""
-
-    labels = frame[label_column].astype(int).to_numpy()
-    positives = int((labels == 1).sum())
-    negatives = int((labels == 0).sum())
-    if positives == 0:
+def get_pos_weight(dataframe: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
+    y = dataframe[label_column].astype(int).values
+    neg = int((y == 0).sum())
+    pos = int((y == 1).sum())
+    if pos == 0:
         return torch.tensor([1.0], dtype=torch.float32)
-    return torch.tensor([negatives / positives], dtype=torch.float32)
+    return torch.tensor([neg / pos], dtype=torch.float32)
 
 
-def get_class_weights(frame: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
-    """Backward-compatible alias used by older EXP-4 code."""
-
-    return get_pos_weight(frame, label_column=label_column)
+# Backwards-compatible alias used by earlier scripts.
+def get_class_weights(dataframe: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
+    return get_pos_weight(dataframe, label_column=label_column)
 
 
 def sample_with_optional_positive_fraction(
     frame: pd.DataFrame,
-    *,
     n_rows: int,
     label_column: str = "label",
     positive_fraction: Optional[float] = None,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Sample rows reproducibly, optionally enriching positives.
-
-    This is intended for smoke/pilot experiments only.  Reportable full results
-    should use the natural project-disjoint folds, not enriched samples.
     """
+    Sample rows for smoke/pilot runs.
 
-    n_rows = min(int(n_rows), len(frame))
-    if n_rows <= 0:
-        return frame.iloc[0:0].copy()
+    If positive_fraction is None, random sample keeps natural-ish prevalence.
+    If provided, sample positives and negatives to approximate that fraction.
+    """
+    if n_rows is None or n_rows <= 0 or len(frame) <= n_rows:
+        return frame.copy().reset_index(drop=True)
 
     rng = np.random.default_rng(random_state)
 
     if positive_fraction is None:
-        return frame.sample(n=n_rows, random_state=random_state).reset_index(drop=True)
+        indices = rng.choice(frame.index.to_numpy(), size=n_rows, replace=False)
+        return frame.loc[indices].copy().reset_index(drop=True)
 
-    positive_fraction = float(positive_fraction)
-    positive_fraction = max(0.0, min(1.0, positive_fraction))
+    positives = frame[frame[label_column].astype(int) == 1]
+    negatives = frame[frame[label_column].astype(int) == 0]
 
-    pos = frame[frame[label_column].astype(int) == 1]
-    neg = frame[frame[label_column].astype(int) == 0]
+    n_pos = min(len(positives), max(1, int(round(n_rows * positive_fraction))))
+    n_neg = min(len(negatives), n_rows - n_pos)
 
-    target_pos = min(len(pos), int(round(n_rows * positive_fraction)))
-    target_neg = min(len(neg), n_rows - target_pos)
+    pos_idx = rng.choice(positives.index.to_numpy(), size=n_pos, replace=False) if n_pos else []
+    neg_idx = rng.choice(negatives.index.to_numpy(), size=n_neg, replace=False) if n_neg else []
+    idx = np.concatenate([pos_idx, neg_idx])
+    rng.shuffle(idx)
 
-    # If one class is too small, fill the remaining rows from the other class.
-    remaining = n_rows - (target_pos + target_neg)
-    if remaining > 0:
-        extra_pos = min(len(pos) - target_pos, remaining)
-        target_pos += extra_pos
-        remaining -= extra_pos
-    if remaining > 0:
-        extra_neg = min(len(neg) - target_neg, remaining)
-        target_neg += extra_neg
-
-    parts = []
-    if target_pos > 0:
-        parts.append(pos.sample(n=target_pos, random_state=random_state))
-    if target_neg > 0:
-        parts.append(neg.sample(n=target_neg, random_state=random_state + 1))
-
-    sampled = pd.concat(parts, axis=0).sample(frac=1.0, random_state=random_state + 2)
-    return sampled.reset_index(drop=True)
+    return frame.loc[idx].copy().reset_index(drop=True)
 
 
 def make_project_disjoint_threshold_split(
     train_frame: pd.DataFrame,
-    *,
+    threshold_fraction: float = 0.20,
     project_column: str = "project",
-    validation_fraction: float = 0.20,
+    label_column: str = "label",
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Split an outer-train frame into fit and threshold subsets by project.
-
-    The threshold subset is used only for threshold selection.  It is not the
-    outer validation fold and it is never the frozen holdout.
     """
+    Split a training frame into model-fit and threshold-selection parts
+    by whole projects. This avoids selecting the operating threshold on
+    the same projects used to fit the linear probe.
+    """
+    projects = train_frame[[project_column, label_column]].groupby(project_column)[label_column].agg(["count", "sum"])
+    project_names = projects.index.to_numpy()
 
-    if train_frame[project_column].nunique() < 2:
-        # Very rare fallback: if there is only one project, row split is the
-        # only possible option.  This should not happen for normal folds.
-        threshold_frame = train_frame.sample(frac=validation_fraction, random_state=random_state)
-        fit_frame = train_frame.drop(index=threshold_frame.index)
-        return fit_frame.reset_index(drop=True), threshold_frame.reset_index(drop=True)
+    rng = np.random.default_rng(random_state)
+    shuffled = project_names.copy()
+    rng.shuffle(shuffled)
 
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=float(validation_fraction),
-        random_state=int(random_state),
-    )
-    indices = np.arange(len(train_frame))
-    groups = train_frame[project_column].astype(str).to_numpy()
-    fit_idx, threshold_idx = next(splitter.split(indices, groups=groups))
+    target_rows = int(round(len(train_frame) * threshold_fraction))
+    selected = []
+    count = 0
 
-    fit_frame = train_frame.iloc[fit_idx].reset_index(drop=True)
-    threshold_frame = train_frame.iloc[threshold_idx].reset_index(drop=True)
+    for project in shuffled:
+        selected.append(project)
+        count += int(projects.loc[project, "count"])
+        if count >= target_rows:
+            break
+
+    selected = set(selected)
+    threshold_mask = train_frame[project_column].isin(selected)
+    threshold_frame = train_frame[threshold_mask].copy().reset_index(drop=True)
+    fit_frame = train_frame[~threshold_mask].copy().reset_index(drop=True)
+
+    # Fallback if project split accidentally produces no positives in either part.
+    if (
+        fit_frame[label_column].sum() == 0
+        or threshold_frame[label_column].sum() == 0
+        or len(fit_frame) == 0
+        or len(threshold_frame) == 0
+    ):
+        shuffled_rows = train_frame.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+        cut = max(1, int(round(len(shuffled_rows) * (1.0 - threshold_fraction))))
+        fit_frame = shuffled_rows.iloc[:cut].copy().reset_index(drop=True)
+        threshold_frame = shuffled_rows.iloc[cut:].copy().reset_index(drop=True)
+
     return fit_frame, threshold_frame
