@@ -1,199 +1,253 @@
-"""Shared NeoBERT model helpers for Case Study 2.
+"""Shared NeoBERT/model utilities for Case Study 2.
 
-The functions here are imported by EXP-3/EXP-4/EXP-5 so that notebooks remain
-thin orchestration layers and experiment logic is not duplicated.
-
-Notes:
-- The current NeoBERT Hugging Face repository uses custom code, so
-  `trust_remote_code=True` is required for the encoder.
-- The public NeoBERT model card lists a BERT tokenizer; we therefore load the
-  tokenizer separately from `google-bert/bert-base-uncased` in experiment code.
-- `xformers` is optional in the current NeoBERT repository, but some Colab
-  environments still fail if the import is missing.  The compatibility shim
-  below provides only the `xformers.ops.SwiGLU` symbol needed by NeoBERT.
+This module is shared by EXP-3, EXP-4, and EXP-5.  It must not contain
+experiment-specific training loops.  It only provides common model/tokenizer
+loading and optional adapter construction helpers.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import sys
 import types
-from typing import Iterable, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
 
+# Public NeoBERT checkpoint used for Case Study 2.
 DEFAULT_NEOBERT_MODEL = "chandar-lab/NeoBERT"
+
+# NeoBERT's released configuration uses a BERT-family tokenizer.  Loading the
+# tokenizer directly avoids importing custom model code during tokenization.
 DEFAULT_NEOBERT_TOKENIZER = "google-bert/bert-base-uncased"
 
 
-def install_neobert_compatibility_shims(verbose: bool = True) -> None:
-    """Install a lightweight xformers.ops.SwiGLU shim when xformers is absent."""
+def configure_huggingface_cache(cache_dir: Optional[str] = "/content/hf_cache") -> None:
+    """Configure Hugging Face cache/download behavior explicitly.
 
-    try:
-        import xformers.ops  # noqa: F401
+    This reduces Colab download stalls and keeps model downloads outside Google
+    Drive unless the caller intentionally chooses a Drive cache.
+    """
+
+    if cache_dir:
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(cache_path)
+        os.environ["TRANSFORMERS_CACHE"] = str(cache_path)
+        os.environ["HF_HUB_CACHE"] = str(cache_path / "hub")
+
+    # Enable the faster transfer package when installed.  If not installed,
+    # Hugging Face silently falls back to normal download.
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+    # Xet transfer can be problematic in some Colab runtimes.  Disabling it is
+    # often more reliable for a university-project notebook.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+def install_xformers_swiglu_shim() -> None:
+    """Install a minimal xformers.ops.SwiGLU shim when xformers is absent.
+
+    Some NeoBERT remote-code versions import ``xformers.ops.SwiGLU``.  Colab
+    often does not have xformers installed.  For inference/feature extraction,
+    a small PyTorch implementation is enough to satisfy the import without
+    forcing a heavy xformers installation.
+    """
+
+    if importlib.util.find_spec("xformers") is not None:
         return
-    except Exception:
-        pass
-
-    if "xformers.ops" in sys.modules:
-        return
-
-    class SwiGLU(nn.Module):
-        """Small PyTorch replacement for xformers.ops.SwiGLU.
-
-        The signature is intentionally permissive because NeoBERT's remote code
-        may pass optional xformers-specific keyword arguments.
-        """
-
-        def __init__(self, in_features, hidden_features=None, out_features=None, bias=True, **kwargs):
-            super().__init__()
-            hidden_features = hidden_features or in_features * 4
-            out_features = out_features or in_features
-            self.w1 = nn.Linear(in_features, hidden_features, bias=bias)
-            self.w2 = nn.Linear(in_features, hidden_features, bias=bias)
-            self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
-
-        def forward(self, x):
-            return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
     xformers_module = types.ModuleType("xformers")
     ops_module = types.ModuleType("xformers.ops")
+
+    class SwiGLU(nn.Module):
+        def forward(self, x):
+            a, b = x.chunk(2, dim=-1)
+            return torch.nn.functional.silu(a) * b
+
     ops_module.SwiGLU = SwiGLU
     xformers_module.ops = ops_module
-    sys.modules["xformers"] = xformers_module
-    sys.modules["xformers.ops"] = ops_module
-
-    if verbose:
-        print("[CS2] Installed lightweight xformers.ops.SwiGLU compatibility shim.")
+    sys.modules.setdefault("xformers", xformers_module)
+    sys.modules.setdefault("xformers.ops", ops_module)
 
 
 def _dtype_from_policy(dtype_policy: str):
     policy = str(dtype_policy).lower()
-    if policy in {"auto", "float16", "fp16"}:
-        return torch.float16 if torch.cuda.is_available() else torch.float32
+    if policy in {"float16", "fp16", "half"}:
+        return torch.float16
     if policy in {"bfloat16", "bf16"}:
         return torch.bfloat16
-    if policy in {"float32", "fp32", "none"}:
+    if policy in {"float32", "fp32", "full"}:
         return torch.float32
+    if policy in {"auto", "none"}:
+        return None
     raise ValueError(f"Unknown dtype_policy: {dtype_policy}")
 
 
-class NeoBertFrozenEncoder(nn.Module):
-    """Frozen NeoBERT encoder returning CLS embeddings."""
+def load_neobert_tokenizer(tokenizer_name: str = DEFAULT_NEOBERT_TOKENIZER):
+    """Load the shared tokenizer used across CS2 experiments."""
+
+    return AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+
+
+def load_neobert_encoder(
+    model_name: str = DEFAULT_NEOBERT_MODEL,
+    *,
+    dtype_policy: str = "float16",
+    device: Optional[torch.device] = None,
+    freeze: bool = True,
+    hf_cache_dir: Optional[str] = "/content/hf_cache",
+):
+    """Load NeoBERT encoder for embedding extraction or classifier wrapping."""
+
+    configure_huggingface_cache(hf_cache_dir)
+    install_xformers_swiglu_shim()
+
+    torch_dtype = _dtype_from_policy(dtype_policy)
+    kwargs = {"trust_remote_code": True}
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+
+    model = AutoModel.from_pretrained(model_name, **kwargs)
+    if freeze:
+        for param in model.parameters():
+            param.requires_grad = False
+        model.eval()
+
+    if device is not None:
+        model.to(device)
+    return model
+
+
+class NeoBertSequenceClassifier(nn.Module):
+    """Reusable NeoBERT sequence classifier wrapper.
+
+    EXP-4 and EXP-5 can adapt this wrapper.  EXP-3 normally uses only the frozen
+    encoder embeddings, not this trainable classifier.
+    """
 
     def __init__(
         self,
         model_name: str = DEFAULT_NEOBERT_MODEL,
         *,
+        num_labels: int = 1,
+        freeze_backbone: bool = False,
         dtype_policy: str = "float16",
-        freeze_backbone: bool = True,
-        trust_remote_code: bool = True,
+        hf_cache_dir: Optional[str] = "/content/hf_cache",
     ):
         super().__init__()
-        install_neobert_compatibility_shims(verbose=True)
-
-        torch_dtype = _dtype_from_policy(dtype_policy)
-        self.backbone = AutoModel.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch_dtype,
-        )
-
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-        self.backbone.eval()
-        self.hidden_size = int(getattr(self.backbone.config, "hidden_size", 768))
-
-    def forward(self, input_ids, attention_mask=None):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        )
-        hidden_states = getattr(outputs, "last_hidden_state", None)
-        if hidden_states is None:
-            hidden_states = outputs[0]
-        return hidden_states[:, 0, :]
-
-
-class NeoBertSequenceClassifier(nn.Module):
-    """Simple NeoBERT sequence classifier retained for EXP-4/EXP-5 reuse."""
-
-    def __init__(
-        self,
-        model_name: str = DEFAULT_NEOBERT_MODEL,
-        freeze_backbone: bool = True,
-        dtype_policy: str = "float16",
-    ):
-        super().__init__()
-        self.encoder = NeoBertFrozenEncoder(
+        self.backbone = load_neobert_encoder(
             model_name=model_name,
             dtype_policy=dtype_policy,
-            freeze_backbone=freeze_backbone,
+            device=None,
+            freeze=freeze_backbone,
+            hf_cache_dir=hf_cache_dir,
         )
-        self.classification_head = nn.Linear(self.encoder.hidden_size, 1)
+        hidden_size = int(self.backbone.config.hidden_size)
+        self.classification_head = nn.Linear(hidden_size, num_labels)
 
-    def forward(self, input_ids, attention_mask):
-        pooled_output = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        logits = self.classification_head(pooled_output.float())
-        return logits.squeeze(-1)
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        cls_embedding = hidden_states[:, 0, :]
+        logits = self.classification_head(cls_embedding)
+        if logits.shape[-1] == 1:
+            return logits.squeeze(-1)
+        return logits
 
 
-def get_exp4_lora_model(model_name: str = DEFAULT_NEOBERT_MODEL, rank: int = 8, lora_alpha: int = 16):
-    """Return a LoRA-ready classifier for EXP-4.
+def count_trainable_parameters(model: nn.Module) -> dict:
+    """Return total/trainable parameter counts."""
 
-    NeoBERT uses a fused qkv projection in its attention blocks; therefore qkv
-    is the default LoRA target rather than separate q_proj/v_proj modules.
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {
+        "total_parameters": int(total),
+        "trainable_parameters": int(trainable),
+        "trainable_fraction": float(trainable / total) if total else 0.0,
+    }
+
+
+def infer_lora_target_modules(model: nn.Module) -> List[str]:
+    """Infer likely LoRA target modules for NeoBERT.
+
+    NeoBERT implementations may use fused qkv projection rather than separate
+    q_proj/v_proj names.  This helper lets EXP-4 inspect the actual model
+    module names rather than hard-coding old target names.
+    """
+
+    names = [name for name, _ in model.named_modules()]
+    candidates = []
+    for key in ["qkv", "Wqkv", "q_proj", "v_proj", "query", "value"]:
+        if any(name.endswith(key) or f".{key}" in name for name in names):
+            candidates.append(key)
+
+    # Prefer fused qkv when available because current NeoBERT code commonly
+    # exposes attention as a fused projection.
+    if "qkv" in candidates:
+        return ["qkv"]
+    if "Wqkv" in candidates:
+        return ["Wqkv"]
+    if "q_proj" in candidates and "v_proj" in candidates:
+        return ["q_proj", "v_proj"]
+    if "query" in candidates and "value" in candidates:
+        return ["query", "value"]
+
+    raise RuntimeError(
+        "Could not infer LoRA target modules from model names. "
+        "Print model.named_modules() and set target_modules manually in EXP-4."
+    )
+
+
+def create_lora_sequence_classifier(
+    *,
+    model_name: str = DEFAULT_NEOBERT_MODEL,
+    rank: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    target_modules: Optional[List[str]] = None,
+    dtype_policy: str = "float16",
+    hf_cache_dir: Optional[str] = "/content/hf_cache",
+):
+    """Create a LoRA-adapted NeoBERT classifier for EXP-4.
+
+    PEFT is imported lazily so EXP-3 does not require PEFT to be installed.
     """
 
     try:
         from peft import LoraConfig, get_peft_model
-    except ImportError as exc:
-        raise ImportError("Install peft before using EXP-4 LoRA: pip install peft") from exc
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        raise ImportError(
+            "PEFT is required for EXP-4 LoRA but is not installed. "
+            "Install with: pip install peft"
+        ) from exc
 
-    base_classifier = NeoBertSequenceClassifier(model_name=model_name, freeze_backbone=False)
-    peft_config = LoraConfig(
-        task_type="SEQ_CLS",
-        r=rank,
-        lora_alpha=lora_alpha,
-        target_modules=["qkv"],
-        lora_dropout=0.05,
+    base = NeoBertSequenceClassifier(
+        model_name=model_name,
+        freeze_backbone=False,
+        dtype_policy=dtype_policy,
+        hf_cache_dir=hf_cache_dir,
+    )
+    if target_modules is None:
+        target_modules = infer_lora_target_modules(base)
+
+    config = LoraConfig(
+        r=int(rank),
+        lora_alpha=int(lora_alpha),
+        target_modules=target_modules,
+        lora_dropout=float(lora_dropout),
         bias="none",
     )
-    return get_peft_model(base_classifier, peft_config)
+    return get_peft_model(base, config)
 
 
-def get_exp5_heft_model(lora_model_path, model_name: str = DEFAULT_NEOBERT_MODEL, reft_rank: int = 4):
-    """Return a ReFT/HEFT model for EXP-5.
+def get_exp4_lora_model(**kwargs):
+    """Backward-compatible EXP-4 alias."""
 
-    Kept as a placeholder-compatible helper; final EXP-5 may need adjustment
-    after EXP-4 LoRA adapter format is finalized.
-    """
-
-    try:
-        import pyreft
-        from peft import PeftModel
-    except ImportError as exc:
-        raise ImportError("Install pyreft and peft before using EXP-5 HEFT/ReFT.") from exc
-
-    base_classifier = NeoBertSequenceClassifier(model_name=model_name, freeze_backbone=False)
-    lora_model = PeftModel.from_pretrained(base_classifier, lora_model_path)
-
-    for param in lora_model.parameters():
-        param.requires_grad = False
-
-    hidden_size = getattr(getattr(lora_model, "config", None), "hidden_size", base_classifier.encoder.hidden_size)
-    reft_config = pyreft.ReftConfig(
-        intervention_type=pyreft.PositionControlledIntervention,
-        embed_dim=hidden_size,
-        low_rank_dimension=reft_rank,
-        intervened_layers=[12, 16, 20, 24],
-        positions="prefix",
-        num_prefix_tokens=2,
-    )
-    return pyreft.get_reft_model(lora_model, reft_config)
+    return create_lora_sequence_classifier(**kwargs)
