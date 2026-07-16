@@ -56,7 +56,7 @@ class Exp3Config:
     hf_cache_dir: Optional[str] = None
     max_length: int = 512
     dtype_policy: str = "bfloat16"
-    embedding_batch_size: int = 32
+    embedding_batch_size: int = 64
 
     logistic_max_iter: int = 2000
     logistic_solver: str = "lbfgs"
@@ -129,6 +129,7 @@ def extract_embeddings(
         label_column=config.label_column,
         source_id_column=config.source_id_column,
         project_column=config.project_column,
+        num_workers=2,
     )
 
     encoder.eval()
