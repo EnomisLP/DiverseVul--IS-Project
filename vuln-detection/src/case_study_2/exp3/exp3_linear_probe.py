@@ -205,8 +205,8 @@ def extract_embeddings(
 # --------------------------------------------------------------------------- #
 
 def _fit_probe(X: np.ndarray, y: np.ndarray, C: float, config: Exp3Config) -> Tuple[StandardScaler, LogisticRegression]:
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
+    scaler = StandardScaler(copy=False)
+    X_s = scaler.fit_transform(X.astype(np.float32, copy=False))
     clf = LogisticRegression(
         C=C,
         max_iter=config.logistic_max_iter,
