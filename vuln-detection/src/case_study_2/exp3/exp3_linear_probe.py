@@ -273,24 +273,39 @@ def run_exp3_nested_probe(
     output_dir: Path,
     additional_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Official nested-CV run over all 5 frozen outer-development folds.
-    Produces pooled, development-only, nested OOF predictions and evaluates
-    them with the shared case_study_1.evaluation / confidence_intervals
-    modules -- exactly like case_study_1.exp0.exp0_nested_alpha.run_exp0_nested_alpha.
-    """
+    import gc
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
+    checkpoint_path = output_dir / "exp3_nested_checkpoint.joblib"
+
     id_to_pos = {rid: pos for pos, rid in enumerate(development_frame[base_config.source_id_column].values)}
     fold_ids = sorted(development_manifest[base_config.fold_column].unique().tolist())
 
-    oof_parts = []
-    selected_alpha_rows = []
-    outer_training_audit = []
+    oof_parts: List[pd.DataFrame] = []
+    selected_alpha_rows: List[Dict[str, Any]] = []
+    outer_training_audit: List[Dict[str, Any]] = []
+    completed_folds: set = set()
+
+    # --- Resume from checkpoint if present ---
+    if checkpoint_path.exists():
+        ckpt = joblib.load(checkpoint_path)
+        oof_parts = ckpt["oof_parts"]
+        selected_alpha_rows = ckpt["selected_alpha_rows"]
+        outer_training_audit = ckpt["outer_training_audit"]
+        completed_folds = ckpt["completed_folds"]
+        if nested_config.verbose:
+            print(f"  [nested] Resuming: {len(completed_folds)}/{len(fold_ids)} outer folds already completed")
 
     for outer_fold_id in fold_ids:
+        if outer_fold_id in completed_folds:
+            if nested_config.verbose:
+                print(f"  [nested] Outer fold {outer_fold_id}: already completed, skipping.")
+            continue
+
+        fold_t0 = time.time()
         if nested_config.verbose:
             print(f"  [nested] Outer fold {outer_fold_id}: inner C grid search...")
 
@@ -345,6 +360,28 @@ def run_exp3_nested_probe(
             "val_projects": int(val_frame[base_config.project_column].nunique()),
         })
 
+        completed_folds.add(outer_fold_id)
+
+        # --- Free intermediate objects before checkpointing / next fold ---
+        del train_frame, val_frame, X_tr, X_va, y_tr, scaler, clf, val_scores, profile
+        gc.collect()
+
+        # --- Checkpoint after every completed outer fold ---
+        joblib.dump({
+            "oof_parts": oof_parts,
+            "selected_alpha_rows": selected_alpha_rows,
+            "outer_training_audit": outer_training_audit,
+            "completed_folds": completed_folds,
+        }, checkpoint_path)
+
+        if nested_config.verbose:
+            fold_min = (time.time() - fold_t0) / 60
+            total_min = (time.time() - t0) / 60
+            print(
+                f"  [nested] Outer fold {outer_fold_id} done in {fold_min:.1f} min "
+                f"| total {total_min:.1f} min | checkpoint saved"
+            )
+
     oof_predictions = pd.concat(oof_parts, axis=0).reset_index(drop=True)
 
     eval_config = evaluation.EvaluationConfig(threshold=nested_config.decision_threshold, expected_n_folds=len(fold_ids))
@@ -371,6 +408,10 @@ def run_exp3_nested_probe(
     }
     with open(artifacts["run_metadata"], "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, default=str)
+
+    # --- Clean up checkpoint on full success ---
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
 
     return {
         "oof_predictions": oof_predictions,
