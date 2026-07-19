@@ -253,9 +253,13 @@ def run_exp3_nested_inner_profile(
 ) -> Dict[str, Any]:
     """
     Profile a single outer-development fold: run the inner project-grouped C
-    grid search only, without producing an OOF prediction. Mirrors
-    run_exp0_nested_inner_profile in case_study_1.exp0.exp0_nested_alpha.
+    grid search only, without producing an OOF prediction.
+
+    Includes gc.collect() after every (inner_fold, C) fit to avoid RAM
+    accumulation across the 3 x 5 = 15 fits per outer fold.
     """
+    import gc
+
     t0 = time.time()
 
     id_to_pos = {rid: pos for pos, rid in enumerate(development_frame[base_config.source_id_column].values)}
@@ -280,14 +284,22 @@ def run_exp3_nested_inner_profile(
         tr_pos = [id_to_pos[rid] for rid in tr_frame[base_config.source_id_column].values]
         va_pos = [id_to_pos[rid] for rid in va_frame[base_config.source_id_column].values]
 
-        X_tr, y_tr = development_embeddings[tr_pos], tr_frame[base_config.label_column].astype(int).values
-        X_va, y_va = development_embeddings[va_pos], va_frame[base_config.label_column].astype(int).values
+        X_tr = development_embeddings[tr_pos]
+        y_tr = tr_frame[base_config.label_column].astype(int).values
+        X_va = development_embeddings[va_pos]
+        y_va = va_frame[base_config.label_column].astype(int).values
 
         for C in nested_config.C_grid:
             scaler, clf = _fit_probe(X_tr, y_tr, C, base_config)
             scores = _predict_probe(scaler, clf, X_va)
             ap = average_precision_score(y_va, scores) if len(np.unique(y_va)) > 1 else float("nan")
             rows.append({"inner_fold": inner_id, "C": C, "average_precision_pr_auc": ap, "n_val": len(y_va)})
+
+            del scaler, clf, scores
+            gc.collect()
+
+        del tr_frame, va_frame, X_tr, X_va, y_tr, y_va
+        gc.collect()
 
     alpha_summary = (
         pd.DataFrame(rows)
@@ -297,6 +309,9 @@ def run_exp3_nested_inner_profile(
         .reset_index(drop=True)
     )
     selected_C = float(alpha_summary.iloc[0]["C"])
+
+    del train_frame
+    gc.collect()
 
     return {
         "outer_fold_id": outer_fold_id,
