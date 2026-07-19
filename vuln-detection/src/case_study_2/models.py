@@ -151,7 +151,11 @@ def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
     if dtype_policy == "float32":
         return torch.float32
     if dtype_policy == "auto":
-        return torch.float16 if device == "cuda" else torch.float32
+        if device == "cuda" and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        if device == "cuda":
+            return torch.float32
+        return torch.float32
 
     raise ValueError(f"Unknown dtype_policy: {dtype_policy}")
 

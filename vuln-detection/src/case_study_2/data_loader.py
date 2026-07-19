@@ -109,12 +109,13 @@ def create_dataloader(
         pad_to_multiple_of=8 if torch.cuda.is_available() else None,
     )
     return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=False,
-        num_workers=num_workers,
-        collate_fn=collator,
+         dataset,
+         batch_size=batch_size,
+         shuffle=shuffle,
+         drop_last=False,
+         num_workers=num_workers,
+         pin_memory=torch.cuda.is_available(),
+         collate_fn=collator,
     )
 
 

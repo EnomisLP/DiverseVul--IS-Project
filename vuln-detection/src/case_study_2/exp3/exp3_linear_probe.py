@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+from tqdm.auto import tqdm
 import numpy as np
 import pandas as pd
 import torch
@@ -56,7 +56,7 @@ class Exp3Config:
     hf_cache_dir: Optional[str] = None
     max_length: int = 512
     dtype_policy: str = "bfloat16"
-    embedding_batch_size: int = 32
+    embedding_batch_size: int = 64
 
     logistic_max_iter: int = 2000
     logistic_solver: str = "lbfgs"
@@ -104,23 +104,39 @@ def extract_embeddings(
     config: Exp3Config,
     device: str,
     cache_path: Optional[Path] = None,
+    checkpoint_every: int = 100,
 ) -> np.ndarray:
-    """
-    Run the frozen NeoBERT encoder once over `frame` and return [CLS] pooled
-    embeddings as a (n_rows, hidden_size) float32 numpy array, in the same
-    row order as `frame`. Cached to `cache_path` (.npy) if provided so the
-    nested C grid search and canonical retrain never re-run the transformer.
-    """
     if cache_path is not None and cache_path.exists():
-        if config.verbose:
-            print(f"  [embed] Loading cached embeddings: {cache_path}")
+        print(f"  [embed] Loading cached embeddings: {cache_path}")
         return np.load(cache_path)
 
     if device != "cuda":
         raise RuntimeError("extract_embeddings must run on a CUDA device.")
 
+   
+    frame = frame.reset_index(drop=True)
+    code_lengths = frame[config.code_column].fillna("").astype(str).str.len()
+    sort_order = code_lengths.sort_values(kind="mergesort").index.to_numpy() 
+    sorted_frame = frame.iloc[sort_order].reset_index(drop=True)
+   
+    inverse_order = np.argsort(sort_order)
+
+    n_rows = len(sorted_frame)
+    n_batches_total = -(-n_rows // config.embedding_batch_size)  
+
+    
+    checkpoint_path = cache_path.with_suffix(".checkpoint.npz") if cache_path is not None else None
+    all_embeddings: List[np.ndarray] = []
+    start_batch = 0
+
+    if checkpoint_path is not None and checkpoint_path.exists():
+        ckpt = np.load(checkpoint_path)
+        all_embeddings = [ckpt["embeddings"]]
+        start_batch = int(ckpt["n_batches"])
+        print(f"  [embed] Resuming from checkpoint: {start_batch}/{n_batches_total} batches already done")
+
     loader = create_dataloader(
-        frame,
+        sorted_frame,
         tokenizer,
         batch_size=config.embedding_batch_size,
         max_length=config.max_length,
@@ -129,13 +145,19 @@ def extract_embeddings(
         label_column=config.label_column,
         source_id_column=config.source_id_column,
         project_column=config.project_column,
+        num_workers=2,
     )
 
     encoder.eval()
-    all_embeddings: List[np.ndarray] = []
     t0 = time.time()
+    t_checkpoint = time.time()
 
-    for batch in loader:
+    pbar = tqdm(total=n_batches_total, initial=start_batch, desc="  [embed] batches")
+
+    for i, batch in enumerate(loader):
+        if i < start_batch:
+            continue
+
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
@@ -144,15 +166,36 @@ def extract_embeddings(
             pooled = outputs.last_hidden_state[:, 0, :]
 
         all_embeddings.append(pooled.float().detach().cpu().numpy())
+        pbar.update(1)
 
-    embeddings = np.concatenate(all_embeddings, axis=0)
+        
+        if checkpoint_path is not None and (i + 1) % checkpoint_every == 0:
+            partial = np.concatenate(all_embeddings, axis=0)
+            np.savez(checkpoint_path, embeddings=partial, n_batches=i + 1)
+            elapsed_min = (time.time() - t0) / 60
+            rate = (i + 1 - start_batch) / max(time.time() - t_checkpoint, 1e-6)
+            eta_min = (n_batches_total - (i + 1)) / max(rate, 1e-6) / 60
+            print(
+                f"  [embed] checkpoint @ batch {i+1}/{n_batches_total} | "
+                f"elapsed {elapsed_min:.1f} min | ETA ~{eta_min:.1f} min | "
+                f"rows so far {partial.shape[0]}"
+            )
 
-    if config.verbose:
-        print(f"  [embed] Extracted {embeddings.shape} in {(time.time() - t0) / 60:.2f} min")
+    pbar.close()
+
+    embeddings_sorted = np.concatenate(all_embeddings, axis=0)
+   
+    embeddings = embeddings_sorted[inverse_order]
+
+    total_min = (time.time() - t0) / 60
+    print(f"  [embed] Extracted {embeddings.shape} in {total_min:.2f} min")
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache_path, embeddings)
+        if checkpoint_path is not None and checkpoint_path.exists():
+            checkpoint_path.unlink()
+            print(f"  [embed] Final cache saved, checkpoint removed: {cache_path}")
 
     return embeddings
 
