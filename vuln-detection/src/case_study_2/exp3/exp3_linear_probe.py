@@ -1,5 +1,5 @@
 """
-EXP-3: NeoBERT frozen-encoder linear probe (Case Study 2).
+EXP-3: CodeBERTa-small-v1 frozen-encoder linear probe (Case Study 2).
 """
 
 from __future__ import annotations
@@ -9,10 +9,11 @@ import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from tqdm.auto import tqdm
+
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import average_precision_score, precision_recall_curve, confusion_matrix
@@ -22,11 +23,13 @@ import joblib
 
 from case_study_2.data_loader import create_dataloader
 from case_study_2.models import (
-    DEFAULT_NEOBERT_MODEL,
-    DEFAULT_NEOBERT_TOKENIZER,
+    DEFAULT_CODE_MODEL,
+    DEFAULT_CODE_TOKENIZER,
     configure_huggingface_cache,
-    load_neobert_tokenizer,
-    load_neobert_encoder,
+    load_code_tokenizer,
+    load_code_encoder,
+    mean_pool_last_hidden,
+    cls_pool_last_hidden,
 )
 
 # Shared, experiment-agnostic modules -- same ones EXP-0/1/2 use.
@@ -43,7 +46,7 @@ from case_study_1 import confidence_intervals
 class Exp3Config:
     """Static, non-tuned configuration for the EXP-3 linear probe."""
 
-    experiment_name: str = "cs2_exp3_neobert_linear_probe"
+    experiment_name: str = "cs2_exp3_codeberta_linear_probe"
 
     code_column: str = "normalized_code"
     source_id_column: str = "source_row_id"
@@ -51,12 +54,16 @@ class Exp3Config:
     project_column: str = "project"
     fold_column: str = "fold"
 
-    model_name: str = DEFAULT_NEOBERT_MODEL
-    tokenizer_name: str = DEFAULT_NEOBERT_TOKENIZER
+    model_name: str = DEFAULT_CODE_MODEL
+    tokenizer_name: str = DEFAULT_CODE_TOKENIZER
     hf_cache_dir: Optional[str] = None
     max_length: int = 512
     dtype_policy: str = "bfloat16"
     embedding_batch_size: int = 64
+
+    # "mean" is the recommended default for a frozen probe (see models.py
+    # docstring); "cls" is kept available for comparison experiments.
+    pooling: str = "mean"
 
     logistic_max_iter: int = 2000
     logistic_solver: str = "lbfgs"
@@ -72,7 +79,7 @@ class NestedProbeConfig:
     """Nested-CV tuning configuration, mirrors NestedAlphaConfig in EXP-0."""
 
     experiment_name: str = "cs2_exp3_nested_probe_dev_grouped"
-    C_grid: Tuple[float, ...] = (1e-3, 1e-2, 1e-1, 1.0, 10.0)
+    C_grid: Tuple[float, ...] = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
     inner_n_splits: int = 3
     inner_random_state: int = 20260707
     selection_metric: str = "average_precision_pr_auc"
@@ -86,7 +93,7 @@ def resolve_device(require_cuda: bool = True) -> str:
         return "cuda"
     if require_cuda:
         raise RuntimeError(
-            "EXP-3 linear probe requires a CUDA GPU for NeoBERT embedding "
+            "EXP-3 linear probe requires a CUDA GPU for CodeBERTa embedding "
             "extraction. No CUDA device was found."
         )
     return "cpu"
@@ -106,25 +113,33 @@ def extract_embeddings(
     cache_path: Optional[Path] = None,
     checkpoint_every: int = 100,
 ) -> np.ndarray:
+    """
+    Run the frozen CodeBERTa encoder once over `frame` and return pooled
+    embeddings as a (n_rows, hidden_size) float32 numpy array, in the same
+    row order as `frame`. Cached to `cache_path` (.npy) if provided.
+
+    Uses length bucketing (sorts by code length before batching, then
+    un-sorts the result) to reduce wasted padding, and checkpoints
+    progress every `checkpoint_every` batches so a crashed/expired Colab
+    session can resume without redoing work already done.
+    """
     if cache_path is not None and cache_path.exists():
-        print(f"  [embed] Loading cached embeddings: {cache_path}")
+        if config.verbose:
+            print(f"  [embed] Loading cached embeddings: {cache_path}")
         return np.load(cache_path)
 
     if device != "cuda":
         raise RuntimeError("extract_embeddings must run on a CUDA device.")
 
-   
     frame = frame.reset_index(drop=True)
     code_lengths = frame[config.code_column].fillna("").astype(str).str.len()
-    sort_order = code_lengths.sort_values(kind="mergesort").index.to_numpy() 
+    sort_order = code_lengths.sort_values(kind="mergesort").index.to_numpy()
     sorted_frame = frame.iloc[sort_order].reset_index(drop=True)
-   
     inverse_order = np.argsort(sort_order)
 
     n_rows = len(sorted_frame)
-    n_batches_total = -(-n_rows // config.embedding_batch_size)  
+    n_batches_total = -(-n_rows // config.embedding_batch_size)
 
-    
     checkpoint_path = cache_path.with_suffix(".checkpoint.npz") if cache_path is not None else None
     all_embeddings: List[np.ndarray] = []
     start_batch = 0
@@ -133,7 +148,8 @@ def extract_embeddings(
         ckpt = np.load(checkpoint_path)
         all_embeddings = [ckpt["embeddings"]]
         start_batch = int(ckpt["n_batches"])
-        print(f"  [embed] Resuming from checkpoint: {start_batch}/{n_batches_total} batches already done")
+        if config.verbose:
+            print(f"  [embed] Resuming from checkpoint: {start_batch}/{n_batches_total} batches already done")
 
     loader = create_dataloader(
         sorted_frame,
@@ -150,8 +166,6 @@ def extract_embeddings(
 
     encoder.eval()
     t0 = time.time()
-    t_checkpoint = time.time()
-
     pbar = tqdm(total=n_batches_total, initial=start_batch, desc="  [embed] batches")
 
     for i, batch in enumerate(loader):
@@ -163,39 +177,34 @@ def extract_embeddings(
 
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = encoder(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = outputs.last_hidden_state[:, 0, :]
+            if config.pooling == "cls":
+                pooled = cls_pool_last_hidden(outputs.last_hidden_state)
+            else:
+                pooled = mean_pool_last_hidden(outputs.last_hidden_state, attention_mask)
 
         all_embeddings.append(pooled.float().detach().cpu().numpy())
         pbar.update(1)
 
-        
         if checkpoint_path is not None and (i + 1) % checkpoint_every == 0:
             partial = np.concatenate(all_embeddings, axis=0)
             np.savez(checkpoint_path, embeddings=partial, n_batches=i + 1)
-            elapsed_min = (time.time() - t0) / 60
-            rate = (i + 1 - start_batch) / max(time.time() - t_checkpoint, 1e-6)
-            eta_min = (n_batches_total - (i + 1)) / max(rate, 1e-6) / 60
-            print(
-                f"  [embed] checkpoint @ batch {i+1}/{n_batches_total} | "
-                f"elapsed {elapsed_min:.1f} min | ETA ~{eta_min:.1f} min | "
-                f"rows so far {partial.shape[0]}"
-            )
+            if config.verbose:
+                elapsed_min = (time.time() - t0) / 60
+                print(f"  [embed] checkpoint @ batch {i+1}/{n_batches_total} | elapsed {elapsed_min:.1f} min")
 
     pbar.close()
 
     embeddings_sorted = np.concatenate(all_embeddings, axis=0)
-   
     embeddings = embeddings_sorted[inverse_order]
 
-    total_min = (time.time() - t0) / 60
-    print(f"  [embed] Extracted {embeddings.shape} in {total_min:.2f} min")
+    if config.verbose:
+        print(f"  [embed] Extracted {embeddings.shape} in {(time.time() - t0) / 60:.2f} min (pooling={config.pooling})")
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache_path, embeddings)
         if checkpoint_path is not None and checkpoint_path.exists():
             checkpoint_path.unlink()
-            print(f"  [embed] Final cache saved, checkpoint removed: {cache_path}")
 
     return embeddings
 
@@ -254,9 +263,6 @@ def run_exp3_nested_inner_profile(
     """
     Profile a single outer-development fold: run the inner project-grouped C
     grid search only, without producing an OOF prediction.
-
-    Includes gc.collect() after every (inner_fold, C) fit to avoid RAM
-    accumulation across the 3 x 5 = 15 fits per outer fold.
     """
     import gc
 
@@ -284,17 +290,14 @@ def run_exp3_nested_inner_profile(
         tr_pos = [id_to_pos[rid] for rid in tr_frame[base_config.source_id_column].values]
         va_pos = [id_to_pos[rid] for rid in va_frame[base_config.source_id_column].values]
 
-        X_tr = development_embeddings[tr_pos]
-        y_tr = tr_frame[base_config.label_column].astype(int).values
-        X_va = development_embeddings[va_pos]
-        y_va = va_frame[base_config.label_column].astype(int).values
+        X_tr, y_tr = development_embeddings[tr_pos], tr_frame[base_config.label_column].astype(int).values
+        X_va, y_va = development_embeddings[va_pos], va_frame[base_config.label_column].astype(int).values
 
         for C in nested_config.C_grid:
             scaler, clf = _fit_probe(X_tr, y_tr, C, base_config)
             scores = _predict_probe(scaler, clf, X_va)
             ap = average_precision_score(y_va, scores) if len(np.unique(y_va)) > 1 else float("nan")
             rows.append({"inner_fold": inner_id, "C": C, "average_precision_pr_auc": ap, "n_val": len(y_va)})
-
             del scaler, clf, scores
             gc.collect()
 
@@ -331,6 +334,11 @@ def run_exp3_nested_probe(
     output_dir: Path,
     additional_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Official nested-CV run over all 5 frozen outer-development folds.
+    Checkpoints after every completed outer fold so a crashed/expired
+    Colab session can resume without redoing finished folds.
+    """
     import gc
 
     output_dir = Path(output_dir)
@@ -347,7 +355,6 @@ def run_exp3_nested_probe(
     outer_training_audit: List[Dict[str, Any]] = []
     completed_folds: set = set()
 
-    # --- Resume from checkpoint if present ---
     if checkpoint_path.exists():
         ckpt = joblib.load(checkpoint_path)
         oof_parts = ckpt["oof_parts"]
@@ -420,11 +427,9 @@ def run_exp3_nested_probe(
 
         completed_folds.add(outer_fold_id)
 
-        # --- Free intermediate objects before checkpointing / next fold ---
         del train_frame, val_frame, X_tr, X_va, y_tr, scaler, clf, val_scores, profile
         gc.collect()
 
-        # --- Checkpoint after every completed outer fold ---
         joblib.dump({
             "oof_parts": oof_parts,
             "selected_alpha_rows": selected_alpha_rows,
@@ -467,7 +472,6 @@ def run_exp3_nested_probe(
     with open(artifacts["run_metadata"], "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, default=str)
 
-    # --- Clean up checkpoint on full success ---
     if checkpoint_path.exists():
         checkpoint_path.unlink()
 
@@ -533,7 +537,7 @@ def run_exp3_holdout_evaluation(
     precision, recall, _ = precision_recall_curve(y_holdout, y_scores)
     ap = holdout_metrics["pooled_metrics"]["average_precision_pr_auc"]
     plt.figure(figsize=(6, 5))
-    plt.plot(recall, precision, color="b", label=f"EXP-3 Linear Probe (PR-AUC = {ap:.4f})")
+    plt.plot(recall, precision, color="b", label=f"EXP-3 CodeBERTa Linear Probe (PR-AUC = {ap:.4f})")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title("Precision-Recall Curve - Frozen Outer Holdout")
