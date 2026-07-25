@@ -1,25 +1,22 @@
-"""
-EXP-3: CodeBERTa-small-v1 frozen-encoder linear probe (Case Study 2).
-"""
-
 from __future__ import annotations
 
+import gc
 import json
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
-from tqdm.auto import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import average_precision_score, precision_recall_curve, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
-import joblib
 
 from case_study_2.data_loader import create_dataloader
 from case_study_2.models import (
@@ -28,24 +25,17 @@ from case_study_2.models import (
     configure_huggingface_cache,
     load_code_tokenizer,
     load_code_encoder,
-    mean_pool_last_hidden,
-    cls_pool_last_hidden,
 )
-
-# Shared, experiment-agnostic modules -- same ones EXP-0/1/2 use.
-from case_study_1 import split_manifest
 from case_study_1 import evaluation
-from case_study_1 import confidence_intervals
+from case_study_1.evaluation import EvaluationConfig
+from case_study_1.confidence_intervals import bootstrap_metric_ci, format_ci_report
 
 
-# --------------------------------------------------------------------------- #
-# Configs
-# --------------------------------------------------------------------------- #
+EXP3_VERSION = "cs2-exp3-codeberta-linear-probe-v1"
 
-@dataclass
+
+@dataclass(frozen=True)
 class Exp3Config:
-    """Static, non-tuned configuration for the EXP-3 linear probe."""
-
     experiment_name: str = "cs2_exp3_codeberta_linear_probe"
 
     code_column: str = "normalized_code"
@@ -60,9 +50,6 @@ class Exp3Config:
     max_length: int = 512
     dtype_policy: str = "bfloat16"
     embedding_batch_size: int = 64
-
-    # "mean" is the recommended default for a frozen probe (see models.py
-    # docstring); "cls" is kept available for comparison experiments.
     pooling: str = "mean"
 
     logistic_max_iter: int = 2000
@@ -70,14 +57,13 @@ class Exp3Config:
     class_weight: str = "balanced"
     decision_threshold: float = 0.50
 
+    n_splits: int = 5
     random_state: int = 42
     verbose: bool = True
 
 
-@dataclass
+@dataclass(frozen=True)
 class NestedProbeConfig:
-    """Nested-CV tuning configuration, mirrors NestedAlphaConfig in EXP-0."""
-
     experiment_name: str = "cs2_exp3_nested_probe_dev_grouped"
     C_grid: Tuple[float, ...] = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
     inner_n_splits: int = 3
@@ -93,15 +79,10 @@ def resolve_device(require_cuda: bool = True) -> str:
         return "cuda"
     if require_cuda:
         raise RuntimeError(
-            "EXP-3 linear probe requires a CUDA GPU for CodeBERTa embedding "
-            "extraction. No CUDA device was found."
+            "EXP-3 linear probe requires a CUDA GPU for embedding extraction."
         )
     return "cpu"
 
-
-# --------------------------------------------------------------------------- #
-# Embedding extraction (the only step that touches the GPU/encoder)
-# --------------------------------------------------------------------------- #
 
 @torch.no_grad()
 def extract_embeddings(
@@ -113,19 +94,7 @@ def extract_embeddings(
     cache_path: Optional[Path] = None,
     checkpoint_every: int = 100,
 ) -> np.ndarray:
-    """
-    Run the frozen CodeBERTa encoder once over `frame` and return pooled
-    embeddings as a (n_rows, hidden_size) float32 numpy array, in the same
-    row order as `frame`. Cached to `cache_path` (.npy) if provided.
-
-    Uses length bucketing (sorts by code length before batching, then
-    un-sorts the result) to reduce wasted padding, and checkpoints
-    progress every `checkpoint_every` batches so a crashed/expired Colab
-    session can resume without redoing work already done.
-    """
     if cache_path is not None and cache_path.exists():
-        if config.verbose:
-            print(f"  [embed] Loading cached embeddings: {cache_path}")
         return np.load(cache_path)
 
     if device != "cuda":
@@ -148,8 +117,6 @@ def extract_embeddings(
         ckpt = np.load(checkpoint_path)
         all_embeddings = [ckpt["embeddings"]]
         start_batch = int(ckpt["n_batches"])
-        if config.verbose:
-            print(f"  [embed] Resuming from checkpoint: {start_batch}/{n_batches_total} batches already done")
 
     loader = create_dataloader(
         sorted_frame,
@@ -166,7 +133,6 @@ def extract_embeddings(
 
     encoder.eval()
     t0 = time.time()
-    pbar = tqdm(total=n_batches_total, initial=start_batch, desc="  [embed] batches")
 
     for i, batch in enumerate(loader):
         if i < start_batch:
@@ -178,12 +144,14 @@ def extract_embeddings(
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = encoder(input_ids=input_ids, attention_mask=attention_mask)
             if config.pooling == "cls":
-                pooled = cls_pool_last_hidden(outputs.last_hidden_state)
+                pooled = outputs.last_hidden_state[:, 0, :]
             else:
-                pooled = mean_pool_last_hidden(outputs.last_hidden_state, attention_mask)
+                mask = attention_mask.unsqueeze(-1).to(outputs.last_hidden_state.dtype)
+                summed = (outputs.last_hidden_state * mask).sum(dim=1)
+                denom = mask.sum(dim=1).clamp(min=1.0)
+                pooled = summed / denom
 
         all_embeddings.append(pooled.float().detach().cpu().numpy())
-        pbar.update(1)
 
         if checkpoint_path is not None and (i + 1) % checkpoint_every == 0:
             partial = np.concatenate(all_embeddings, axis=0)
@@ -192,13 +160,8 @@ def extract_embeddings(
                 elapsed_min = (time.time() - t0) / 60
                 print(f"  [embed] checkpoint @ batch {i+1}/{n_batches_total} | elapsed {elapsed_min:.1f} min")
 
-    pbar.close()
-
     embeddings_sorted = np.concatenate(all_embeddings, axis=0)
     embeddings = embeddings_sorted[inverse_order]
-
-    if config.verbose:
-        print(f"  [embed] Extracted {embeddings.shape} in {(time.time() - t0) / 60:.2f} min (pooling={config.pooling})")
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,10 +171,6 @@ def extract_embeddings(
 
     return embeddings
 
-
-# --------------------------------------------------------------------------- #
-# Probe fitting helpers
-# --------------------------------------------------------------------------- #
 
 def _fit_probe(X: np.ndarray, y: np.ndarray, C: float, config: Exp3Config) -> Tuple[StandardScaler, LogisticRegression]:
     scaler = StandardScaler(copy=False)
@@ -228,7 +187,7 @@ def _fit_probe(X: np.ndarray, y: np.ndarray, C: float, config: Exp3Config) -> Tu
 
 
 def _predict_probe(scaler: StandardScaler, clf: LogisticRegression, X: np.ndarray) -> np.ndarray:
-    return clf.predict_proba(scaler.transform(X))[:, 1]
+    return clf.predict_proba(scaler.transform(X.astype(np.float32, copy=False)))[:, 1]
 
 
 def _grouped_inner_folds(
@@ -237,7 +196,6 @@ def _grouped_inner_folds(
     n_splits: int,
     random_state: int,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """Project-grouped inner K-fold split (shuffled, deterministic)."""
     shuffled = frame.sample(frac=1.0, random_state=random_state)
     gkf = GroupKFold(n_splits=n_splits)
     splits = []
@@ -248,10 +206,6 @@ def _grouped_inner_folds(
     return splits
 
 
-# --------------------------------------------------------------------------- #
-# Nested CV (development-only, no outer holdout touched)
-# --------------------------------------------------------------------------- #
-
 def run_exp3_nested_inner_profile(
     development_frame: pd.DataFrame,
     development_embeddings: np.ndarray,
@@ -260,12 +214,6 @@ def run_exp3_nested_inner_profile(
     base_config: Exp3Config,
     nested_config: NestedProbeConfig,
 ) -> Dict[str, Any]:
-    """
-    Profile a single outer-development fold: run the inner project-grouped C
-    grid search only, without producing an OOF prediction.
-    """
-    import gc
-
     t0 = time.time()
 
     id_to_pos = {rid: pos for pos, rid in enumerate(development_frame[base_config.source_id_column].values)}
@@ -290,8 +238,10 @@ def run_exp3_nested_inner_profile(
         tr_pos = [id_to_pos[rid] for rid in tr_frame[base_config.source_id_column].values]
         va_pos = [id_to_pos[rid] for rid in va_frame[base_config.source_id_column].values]
 
-        X_tr, y_tr = development_embeddings[tr_pos], tr_frame[base_config.label_column].astype(int).values
-        X_va, y_va = development_embeddings[va_pos], va_frame[base_config.label_column].astype(int).values
+        X_tr = development_embeddings[tr_pos]
+        y_tr = tr_frame[base_config.label_column].astype(int).values
+        X_va = development_embeddings[va_pos]
+        y_va = va_frame[base_config.label_column].astype(int).values
 
         for C in nested_config.C_grid:
             scaler, clf = _fit_probe(X_tr, y_tr, C, base_config)
@@ -308,7 +258,7 @@ def run_exp3_nested_inner_profile(
         pd.DataFrame(rows)
         .groupby("C", as_index=False)["average_precision_pr_auc"]
         .mean()
-        .sort_values("average_precision_pr_auc", ascending=False)
+        .sort_values(["average_precision_pr_auc", "C"], ascending=[False, False])
         .reset_index(drop=True)
     )
     selected_C = float(alpha_summary.iloc[0]["C"])
@@ -325,6 +275,51 @@ def run_exp3_nested_inner_profile(
     }
 
 
+def _checkpoint_paths(output_dir: Path, outer_fold_id: int) -> Dict[str, Path]:
+    root = output_dir / "checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    prefix = f"outer_fold_{outer_fold_id}"
+    return {
+        "predictions": root / f"{prefix}_predictions.parquet",
+        "selected": root / f"{prefix}_selected_C.json",
+        "training": root / f"{prefix}_outer_training.json",
+    }
+
+
+def _write_outer_checkpoint(output_dir: Path, outer_fold_id: int, predictions: pd.DataFrame, selected: dict, training: dict) -> None:
+    paths = _checkpoint_paths(output_dir, outer_fold_id)
+    predictions.to_parquet(paths["predictions"], index=False)
+    with paths["selected"].open("w", encoding="utf-8") as f:
+        json.dump(selected, f, indent=2, default=str)
+    with paths["training"].open("w", encoding="utf-8") as f:
+        json.dump(training, f, indent=2, default=str)
+
+
+def _load_outer_checkpoint(output_dir: Path, outer_fold_id: int) -> Optional[dict]:
+    paths = _checkpoint_paths(output_dir, outer_fold_id)
+    if not all(p.exists() for p in paths.values()):
+        return None
+    with paths["selected"].open("r", encoding="utf-8") as f:
+        selected = json.load(f)
+    with paths["training"].open("r", encoding="utf-8") as f:
+        training = json.load(f)
+    return {
+        "predictions": pd.read_parquet(paths["predictions"]),
+        "selected": selected,
+        "training": training,
+    }
+
+
+def _update_run_state(state_path: Path, completed_folds, status: str) -> None:
+    state = {
+        "status": status,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+        "completed_outer_folds": sorted(int(f) for f in completed_folds),
+    }
+    with state_path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
 def run_exp3_nested_probe(
     development_frame: pd.DataFrame,
     development_embeddings: np.ndarray,
@@ -333,44 +328,32 @@ def run_exp3_nested_probe(
     nested_config: NestedProbeConfig,
     output_dir: Path,
     additional_metadata: Optional[Dict[str, Any]] = None,
+    resume: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Official nested-CV run over all 5 frozen outer-development folds.
-    Checkpoints after every completed outer fold so a crashed/expired
-    Colab session can resume without redoing finished folds.
-    """
-    import gc
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "exp3_nested_run_state.json"
     t0 = time.time()
-
-    checkpoint_path = output_dir / "exp3_nested_checkpoint.joblib"
 
     id_to_pos = {rid: pos for pos, rid in enumerate(development_frame[base_config.source_id_column].values)}
     fold_ids = sorted(development_manifest[base_config.fold_column].unique().tolist())
 
-    oof_parts: List[pd.DataFrame] = []
-    selected_alpha_rows: List[Dict[str, Any]] = []
-    outer_training_audit: List[Dict[str, Any]] = []
-    completed_folds: set = set()
-
-    if checkpoint_path.exists():
-        ckpt = joblib.load(checkpoint_path)
-        oof_parts = ckpt["oof_parts"]
-        selected_alpha_rows = ckpt["selected_alpha_rows"]
-        outer_training_audit = ckpt["outer_training_audit"]
-        completed_folds = ckpt["completed_folds"]
-        if nested_config.verbose:
-            print(f"  [nested] Resuming: {len(completed_folds)}/{len(fold_ids)} outer folds already completed")
+    oof_parts = []
+    selected_rows = []
+    outer_training_rows = []
+    completed_folds = []
 
     for outer_fold_id in fold_ids:
-        if outer_fold_id in completed_folds:
+        checkpoint = _load_outer_checkpoint(output_dir, outer_fold_id) if resume else None
+        if checkpoint is not None:
+            oof_parts.append(checkpoint["predictions"])
+            selected_rows.append(checkpoint["selected"])
+            outer_training_rows.append(checkpoint["training"])
+            completed_folds.append(outer_fold_id)
             if nested_config.verbose:
-                print(f"  [nested] Outer fold {outer_fold_id}: already completed, skipping.")
+                print(f"  [nested] Outer fold {outer_fold_id}: loaded from checkpoint.")
             continue
 
-        fold_t0 = time.time()
         if nested_config.verbose:
             print(f"  [nested] Outer fold {outer_fold_id}: inner C grid search...")
 
@@ -379,7 +362,6 @@ def run_exp3_nested_probe(
             outer_fold_id, base_config, nested_config,
         )
         selected_C = profile["selected_C"]["selected_C"]
-        selected_alpha_rows.append(profile["selected_C"])
 
         train_ids = set(
             development_manifest.loc[
@@ -414,44 +396,36 @@ def run_exp3_nested_probe(
             "y_score": val_scores,
             "fold": outer_fold_id,
         })
-        oof_parts.append(fold_oof)
 
-        outer_training_audit.append({
+        selected_row = {"outer_fold_id": outer_fold_id, "selected_C": selected_C}
+        training_row = {
             "outer_fold_id": outer_fold_id,
             "selected_C": selected_C,
             "n_train": int(len(train_frame)),
             "n_val": int(len(val_frame)),
             "train_projects": int(train_frame[base_config.project_column].nunique()),
             "val_projects": int(val_frame[base_config.project_column].nunique()),
-        })
+        }
 
-        completed_folds.add(outer_fold_id)
+        _write_outer_checkpoint(output_dir, outer_fold_id, fold_oof, selected_row, training_row)
+
+        oof_parts.append(fold_oof)
+        selected_rows.append(selected_row)
+        outer_training_rows.append(training_row)
+        completed_folds.append(outer_fold_id)
+
+        _update_run_state(state_path, completed_folds, status="running")
 
         del train_frame, val_frame, X_tr, X_va, y_tr, scaler, clf, val_scores, profile
         gc.collect()
 
-        joblib.dump({
-            "oof_parts": oof_parts,
-            "selected_alpha_rows": selected_alpha_rows,
-            "outer_training_audit": outer_training_audit,
-            "completed_folds": completed_folds,
-        }, checkpoint_path)
-
-        if nested_config.verbose:
-            fold_min = (time.time() - fold_t0) / 60
-            total_min = (time.time() - t0) / 60
-            print(
-                f"  [nested] Outer fold {outer_fold_id} done in {fold_min:.1f} min "
-                f"| total {total_min:.1f} min | checkpoint saved"
-            )
-
     oof_predictions = pd.concat(oof_parts, axis=0).reset_index(drop=True)
 
-    eval_config = evaluation.EvaluationConfig(threshold=nested_config.decision_threshold, expected_n_folds=len(fold_ids))
+    eval_config = EvaluationConfig(threshold=nested_config.decision_threshold, expected_n_folds=len(fold_ids))
     eval_results = evaluation.evaluate_oof_predictions(oof_predictions, config=eval_config)
 
-    selected_alpha_df = pd.DataFrame(selected_alpha_rows)
-    outer_training_df = pd.DataFrame(outer_training_audit)
+    selected_df = pd.DataFrame(selected_rows)
+    outer_training_df = pd.DataFrame(outer_training_rows)
 
     artifacts = {
         "oof_predictions": output_dir / "exp3_nested_oof_predictions.parquet",
@@ -460,10 +434,11 @@ def run_exp3_nested_probe(
         "run_metadata": output_dir / "exp3_nested_run_metadata.json",
     }
     oof_predictions.to_parquet(artifacts["oof_predictions"], index=False)
-    selected_alpha_df.to_csv(artifacts["selected_C_per_fold"], index=False)
+    selected_df.to_csv(artifacts["selected_C_per_fold"], index=False)
     outer_training_df.to_csv(artifacts["outer_training_audit"], index=False)
 
     metadata = {
+        "exp3_version": EXP3_VERSION,
         "base_config": asdict(base_config),
         "nested_config": {**asdict(nested_config), "C_grid": list(nested_config.C_grid)},
         "runtime_seconds": time.time() - t0,
@@ -472,21 +447,16 @@ def run_exp3_nested_probe(
     with open(artifacts["run_metadata"], "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, default=str)
 
-    if checkpoint_path.exists():
-        checkpoint_path.unlink()
+    _update_run_state(state_path, completed_folds, status="completed")
 
     return {
         "oof_predictions": oof_predictions,
         "evaluation": eval_results,
-        "selected_alpha": selected_alpha_df,
+        "selected_C": selected_df,
         "outer_fold_training": outer_training_df,
         "artifacts": artifacts,
     }
 
-
-# --------------------------------------------------------------------------- #
-# Canonical retraining + frozen outer-holdout scoring
-# --------------------------------------------------------------------------- #
 
 def run_exp3_canonical_retrain(
     development_frame: pd.DataFrame,
@@ -514,6 +484,8 @@ def run_exp3_holdout_evaluation(
     clf: LogisticRegression,
     base_config: Exp3Config,
     output_dir: Path,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -523,21 +495,33 @@ def run_exp3_holdout_evaluation(
 
     holdout_predictions = pd.DataFrame({
         base_config.source_id_column: holdout_frame[base_config.source_id_column].values,
-        base_config.project_column: holdout_frame[base_config.project_column].values,
+        "project": holdout_frame[base_config.project_column].values,
         "label": y_holdout,
         "y_score": y_scores,
         "fold": 0,
     })
     holdout_predictions.to_csv(output_dir / "exp3_holdout_predictions.csv", index=False)
 
-    eval_config = evaluation.EvaluationConfig(threshold=base_config.decision_threshold, expected_n_folds=1)
+    eval_config = EvaluationConfig(threshold=base_config.decision_threshold, expected_n_folds=1)
     holdout_metrics = evaluation.evaluate_oof_predictions(holdout_predictions, config=eval_config)
     print(evaluation.format_metric_report(holdout_metrics["pooled_metrics"]))
+
+    ci_result = bootstrap_metric_ci(
+        holdout_predictions,
+        metric="average_precision_pr_auc",
+        group_column="project",
+        n_bootstrap=n_bootstrap,
+        confidence=confidence,
+        random_state=base_config.random_state,
+    )
+    with open(output_dir / "exp3_holdout_pr_auc_bootstrap_ci.json", "w", encoding="utf-8") as f:
+        json.dump(ci_result.as_dict(), f, indent=2)
+    print(format_ci_report(ci_result))
 
     precision, recall, _ = precision_recall_curve(y_holdout, y_scores)
     ap = holdout_metrics["pooled_metrics"]["average_precision_pr_auc"]
     plt.figure(figsize=(6, 5))
-    plt.plot(recall, precision, color="b", label=f"EXP-3 CodeBERTa Linear Probe (PR-AUC = {ap:.4f})")
+    plt.plot(recall, precision, color="b", label=f"EXP-3 Linear Probe (PR-AUC = {ap:.4f})")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title("Precision-Recall Curve - Frozen Outer Holdout")
@@ -565,5 +549,6 @@ def run_exp3_holdout_evaluation(
     return {
         "holdout_predictions": holdout_predictions,
         "holdout_metrics": holdout_metrics,
+        "bootstrap_ci": ci_result.as_dict(),
         "y_pred": y_pred,
     }

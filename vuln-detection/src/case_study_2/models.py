@@ -1,18 +1,3 @@
-"""
-Shared CodeBERTa-small-v1 model utilities for Case Study 2.
-
-Shared by:
-  - EXP-3 Frozen Linear Probe
-  - EXP-4 LoRA
-
-CodeBERTa-small-v1 is a standard RoBERTa-architecture encoder pretrained on
-CodeSearchNet source code. Unlike NeoBERT, it needs no trust_remote_code,
-no xformers/SwiGLU compatibility shims, and no custom runtime patches --
-it loads via plain transformers.AutoModel / AutoTokenizer.
-
-This file must not contain experiment-specific training loops.
-"""
-
 from __future__ import annotations
 
 import os
@@ -26,29 +11,24 @@ from transformers import AutoModel, AutoTokenizer
 
 
 DEFAULT_CODE_MODEL = "huggingface/CodeBERTa-small-v1"
-DEFAULT_CODE_TOKENIZER = "huggingface/CodeBERTa-small-v1"  # ships its own code-trained BPE tokenizer
+DEFAULT_CODE_TOKENIZER = "huggingface/CodeBERTa-small-v1"
 
 
 def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
-    """
-    Configure Hugging Face cache and safer transfer behavior for Colab.
-    Should be called before model/tokenizer loading.
-    """
     if hf_cache_dir:
         hf_cache_dir = str(hf_cache_dir)
         os.environ.setdefault("HF_HOME", hf_cache_dir)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(hf_cache_dir) / "hub"))
-
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
     os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
     dtype_policy = (dtype_policy or "auto").lower()
     device = str(device)
-
     if dtype_policy == "float16":
         return torch.float16 if device == "cuda" else torch.float32
     if dtype_policy == "bfloat16":
@@ -61,7 +41,6 @@ def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
         if device == "cuda":
             return torch.float32
         return torch.float32
-
     raise ValueError(f"Unknown dtype_policy: {dtype_policy}")
 
 
@@ -84,20 +63,11 @@ def load_code_encoder(
     freeze: bool = True,
     hf_cache_dir: Optional[str] = None,
 ) -> nn.Module:
-    """
-    Load the CodeBERTa encoder. Standard AutoModel loading -- no runtime
-    patches required (unlike NeoBERT's custom architecture).
-    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     configure_huggingface_cache(hf_cache_dir)
-
     dtype = _dtype_from_policy(dtype_policy, device)
-    is_local_path = Path(str(model_name)).exists()
 
-    kwargs: Dict[str, Any] = {
-        "cache_dir": hf_cache_dir,
-        "local_files_only": bool(is_local_path),
-    }
+    kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir}
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
 
@@ -113,12 +83,6 @@ def load_code_encoder(
 
 
 def mean_pool_last_hidden(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Mean-pool token embeddings using the attention mask.
-    Preferred default for frozen probes: raw CLS-token embeddings from a
-    frozen encoder without a pooling-specific pretraining objective are a
-    known weak sentence representation (Reimers & Gurevych, 2019).
-    """
     mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
     summed = (last_hidden_state * mask).sum(dim=1)
     denom = mask.sum(dim=1).clamp(min=1.0)
@@ -126,18 +90,10 @@ def mean_pool_last_hidden(last_hidden_state: torch.Tensor, attention_mask: torch
 
 
 def cls_pool_last_hidden(last_hidden_state: torch.Tensor) -> torch.Tensor:
-    """Use first token (<s> / CLS-equivalent) embedding."""
     return last_hidden_state[:, 0, :]
 
 
 class CodeSequenceClassifier(nn.Module):
-    """
-    Shared sequence classifier wrapper for LoRA-style fine-tuning (EXP-4).
-    EXP-3's linear probe normally only uses frozen encoder embeddings
-    extracted separately, but this class is reused wherever an end-to-end
-    trainable classification head is needed.
-    """
-
     def __init__(
         self,
         model_name: str = DEFAULT_CODE_MODEL,
@@ -182,24 +138,16 @@ def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
 
 
 def infer_lora_target_modules(model: nn.Module) -> List[str]:
-    """
-    Infer LoRA target module names for a RoBERTa-family encoder (CodeBERTa).
-    RoBERTa self-attention uses separate `query` / `value` Linear layers
-    (not a fused qkv projection like NeoBERT), so this is the expected match.
-    """
     module_names = [name for name, _ in model.named_modules()]
-
     candidate_sets = [
-        ["query", "value"],
-        ["q_proj", "v_proj"],
         ["qkv"],
+        ["q_proj", "v_proj"],
+        ["query", "value"],
         ["in_proj"],
     ]
-
     for candidates in candidate_sets:
         if all(any(name.endswith(candidate) or f".{candidate}" in name for name in module_names) for candidate in candidates):
             return candidates
-
     return ["query", "value"]
 
 
@@ -208,27 +156,20 @@ def create_lora_sequence_classifier(
     rank: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
+    pooling: str = "mean",
     dtype_policy: str = "auto",
     hf_cache_dir: Optional[str] = None,
 ):
-    """
-    Shared LoRA model creation helper for EXP-4. PEFT is imported lazily.
-    """
-    try:
-        from peft import LoraConfig, get_peft_model
-    except Exception as exc:
-        raise ImportError("PEFT is required for EXP-4 LoRA. Install with `pip install peft`.") from exc
+    from peft import LoraConfig, get_peft_model
 
     base = CodeSequenceClassifier(
         model_name=model_name,
         freeze_backbone=False,
-        pooling="mean",
+        pooling=pooling,
         dtype_policy=dtype_policy,
         hf_cache_dir=hf_cache_dir,
     )
-
     target_modules = infer_lora_target_modules(base)
-
     config = LoraConfig(
         r=rank,
         lora_alpha=lora_alpha,
@@ -240,17 +181,10 @@ def create_lora_sequence_classifier(
     return get_peft_model(base, config)
 
 
-def get_exp4_lora_model(
-    model_name: str = DEFAULT_CODE_MODEL,
-    rank: int = 8,
-    lora_alpha: int = 16,
-    dtype_policy: str = "auto",
-    hf_cache_dir: Optional[str] = None,
-):
+def get_lora_model(model_name: str = DEFAULT_CODE_MODEL, rank: int = 8, lora_alpha: int = 16, pooling: str = "mean"):
     return create_lora_sequence_classifier(
         model_name=model_name,
         rank=rank,
         lora_alpha=lora_alpha,
-        dtype_policy=dtype_policy,
-        hf_cache_dir=hf_cache_dir,
+        pooling=pooling,
     )

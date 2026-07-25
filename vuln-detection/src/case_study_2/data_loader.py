@@ -1,9 +1,3 @@
-"""
-Shared data loading utilities for Case Study 2.
-
-This module is reusable by EXP-3, EXP-4, and EXP-5.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,11 +13,6 @@ EMPTY_CODE_SENTINEL = "EMPTY_CODE_SAMPLE"
 
 
 class CodeTextDataset(Dataset):
-    """
-    Dataset that stores raw code text and labels.
-    Tokenization is handled by TransformerBatchCollator for dynamic padding.
-    """
-
     def __init__(
         self,
         dataframe: pd.DataFrame,
@@ -78,7 +67,7 @@ class TransformerBatchCollator:
         projects = [feature["project"] for feature in features]
 
         enc["labels"] = labels
-        enc["label"] = labels  # backwards compatibility with old scripts
+        enc["label"] = labels
         enc["source_row_id"] = source_row_ids
         enc["project"] = projects
         return enc
@@ -109,13 +98,13 @@ def create_dataloader(
         pad_to_multiple_of=8 if torch.cuda.is_available() else None,
     )
     return DataLoader(
-         dataset,
-         batch_size=batch_size,
-         shuffle=shuffle,
-         drop_last=False,
-         num_workers=num_workers,
-         pin_memory=torch.cuda.is_available(),
-         collate_fn=collator,
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collator,
     )
 
 
@@ -128,7 +117,6 @@ def get_pos_weight(dataframe: pd.DataFrame, label_column: str = "label") -> torc
     return torch.tensor([neg / pos], dtype=torch.float32)
 
 
-# Backwards-compatible alias used by earlier scripts.
 def get_class_weights(dataframe: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
     return get_pos_weight(dataframe, label_column=label_column)
 
@@ -140,12 +128,6 @@ def sample_with_optional_positive_fraction(
     positive_fraction: Optional[float] = None,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """
-    Sample rows for smoke/pilot runs.
-
-    If positive_fraction is None, random sample keeps natural-ish prevalence.
-    If provided, sample positives and negatives to approximate that fraction.
-    """
     if n_rows is None or n_rows <= 0 or len(frame) <= n_rows:
         return frame.copy().reset_index(drop=True)
 
@@ -176,11 +158,6 @@ def make_project_disjoint_threshold_split(
     label_column: str = "label",
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Split a training frame into model-fit and threshold-selection parts
-    by whole projects. This avoids selecting the operating threshold on
-    the same projects used to fit the linear probe.
-    """
     projects = train_frame[[project_column, label_column]].groupby(project_column)[label_column].agg(["count", "sum"])
     project_names = projects.index.to_numpy()
 
@@ -203,7 +180,6 @@ def make_project_disjoint_threshold_split(
     threshold_frame = train_frame[threshold_mask].copy().reset_index(drop=True)
     fit_frame = train_frame[~threshold_mask].copy().reset_index(drop=True)
 
-    # Fallback if project split accidentally produces no positives in either part.
     if (
         fit_frame[label_column].sum() == 0
         or threshold_frame[label_column].sum() == 0
