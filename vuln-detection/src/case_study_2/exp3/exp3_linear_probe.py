@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupKFold
 from sklearn.metrics import average_precision_score, precision_recall_curve, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
@@ -27,6 +26,7 @@ from case_study_2.models import (
     load_code_encoder,
 )
 from case_study_1 import evaluation
+from case_study_1 import split_manifest
 from case_study_1.evaluation import EvaluationConfig
 from case_study_1.confidence_intervals import bootstrap_metric_ci, format_ci_report
 
@@ -192,18 +192,24 @@ def _predict_probe(scaler: StandardScaler, clf: LogisticRegression, X: np.ndarra
 
 def _grouped_inner_folds(
     frame: pd.DataFrame,
+    source_id_column: str,
+    label_column: str,
     project_column: str,
     n_splits: int,
     random_state: int,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    shuffled = frame.sample(frac=1.0, random_state=random_state)
-    gkf = GroupKFold(n_splits=n_splits)
-    splits = []
-    for train_pos, val_pos in gkf.split(shuffled, groups=shuffled[project_column]):
-        train_idx = shuffled.index.to_numpy()[train_pos]
-        val_idx = shuffled.index.to_numpy()[val_pos]
-        splits.append((train_idx, val_idx))
-    return splits
+) -> pd.DataFrame:
+    inner_split_config = split_manifest.SplitConfig(
+        n_splits=n_splits,
+        random_state=random_state,
+        shuffle=True,
+        source_id_column=source_id_column,
+        label_column=label_column,
+        group_column=project_column,
+    )
+    return split_manifest.create_project_grouped_manifest(
+        frame[[source_id_column, label_column, project_column]],
+        config=inner_split_config,
+    )
 
 
 def run_exp3_nested_inner_profile(
@@ -227,14 +233,17 @@ def run_exp3_nested_inner_profile(
         development_frame[base_config.source_id_column].isin(outer_train_ids)
     ].reset_index(drop=True)
 
-    inner_splits = _grouped_inner_folds(
-        train_frame, base_config.project_column, nested_config.inner_n_splits, nested_config.inner_random_state
+    inner_manifest = _grouped_inner_folds(
+        train_frame, base_config.source_id_column, base_config.label_column,
+        base_config.project_column, nested_config.inner_n_splits, nested_config.inner_random_state,
     )
 
     rows = []
-    for inner_id, (tr_idx, va_idx) in enumerate(inner_splits):
-        tr_frame = train_frame.loc[tr_idx]
-        va_frame = train_frame.loc[va_idx]
+    for inner_id in range(nested_config.inner_n_splits):
+        tr_ids = set(inner_manifest.loc[inner_manifest["fold"] != inner_id, "source_row_id"])
+        va_ids = set(inner_manifest.loc[inner_manifest["fold"] == inner_id, "source_row_id"])
+        tr_frame = train_frame[train_frame[base_config.source_id_column].isin(tr_ids)]
+        va_frame = train_frame[train_frame[base_config.source_id_column].isin(va_ids)]
         tr_pos = [id_to_pos[rid] for rid in tr_frame[base_config.source_id_column].values]
         va_pos = [id_to_pos[rid] for rid in va_frame[base_config.source_id_column].values]
 

@@ -150,9 +150,17 @@ def run_exp4_nested_rank(
         outer_train_df = development_frame[development_frame[config.source_id_column].isin(outer_train_ids)].reset_index(drop=True)
         outer_val_df = development_frame[development_frame[config.source_id_column].isin(outer_val_ids)].reset_index(drop=True)
 
-        inner_cv_manifest = split_manifest.load_manifest(
+        inner_split_config = split_manifest.SplitConfig(
+            n_splits=config.inner_n_splits,
+            random_state=config.inner_random_state,
+            shuffle=True,
+            source_id_column=config.source_id_column,
+            label_column=config.label_column,
+            group_column=config.project_column,
+        )
+        inner_cv_manifest = split_manifest.create_project_grouped_manifest(
             outer_train_df[[config.source_id_column, config.label_column, config.project_column]],
-            config=split_manifest.SplitConfig(n_splits=config.inner_n_splits, random_state=config.inner_random_state, shuffle=True),
+            config=inner_split_config,
         )
 
         rank_performance = {}
