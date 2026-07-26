@@ -48,6 +48,9 @@ class Exp4Config:
     inner_random_state: int = 20260707
     decision_threshold: float = 0.50
 
+    search_epochs: int = 1
+    search_n_splits: int = 4
+
     n_splits: int = 5
     random_state: int = 42
     verbose: bool = True
@@ -62,6 +65,27 @@ def _checkpoint_paths(output_dir: Path, outer_fold_id: int) -> Dict[str, Path]:
         "selected": root / f"{prefix}_selected_rank.json",
         "training": root / f"{prefix}_outer_training.json",
     }
+
+
+def _search_checkpoint_path(output_dir: Path, outer_fold_id: int) -> Path:
+    root = output_dir / "checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"outer_fold_{outer_fold_id}_search_progress.json"
+
+
+def _load_search_checkpoint(output_dir: Path, outer_fold_id: int) -> Dict[str, float]:
+    path = _search_checkpoint_path(output_dir, outer_fold_id)
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return {int(k): float(v) for k, v in raw.items()}
+
+
+def _save_search_checkpoint(output_dir: Path, outer_fold_id: int, rank_performance: Dict[int, float]) -> None:
+    path = _search_checkpoint_path(output_dir, outer_fold_id)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in rank_performance.items()}, f, indent=2)
 
 
 def _write_outer_checkpoint(output_dir: Path, outer_fold_id: int, predictions: pd.DataFrame, selected: dict, training: dict) -> None:
@@ -118,6 +142,8 @@ def run_exp4_nested_rank(
     tokenizer = load_code_tokenizer(DEFAULT_CODE_TOKENIZER, hf_cache_dir=config.hf_cache_dir)
 
     fold_ids = sorted(development_manifest[config.fold_column].unique().tolist())
+    print(f"[nested] Starting EXP-4 nested rank search over {len(fold_ids)} outer folds, rank_grid={config.rank_grid}")
+    print(f"[nested] Search phase: {config.search_epochs} epoch(s), single held-out split | Refit phase: {config.epochs} epoch(s), full training")
 
     oof_parts = []
     selected_rows = []
@@ -134,12 +160,11 @@ def run_exp4_nested_rank(
             outer_training_rows.append(checkpoint["training"])
             completed_folds.append(outer_fold_id)
             if config.verbose:
-                print(f"[nested] Outer fold {outer_fold_id}: loaded from checkpoint.")
+                print(f"[nested] Outer fold {outer_fold_id}: loaded from checkpoint, skipping.")
             continue
 
         fold_t0 = time.time()
-        if config.verbose:
-            print(f"[nested] Outer fold {outer_fold_id}: inner rank grid search...")
+        print(f"\n=================== OUTER FOLD {outer_fold_id} ({len(completed_folds)+1}/{len(fold_ids)}) ===================")
 
         outer_train_ids = development_manifest.loc[
             development_manifest[config.fold_column] != outer_fold_id, config.source_id_column
@@ -149,56 +174,69 @@ def run_exp4_nested_rank(
         ]
         outer_train_df = development_frame[development_frame[config.source_id_column].isin(outer_train_ids)].reset_index(drop=True)
         outer_val_df = development_frame[development_frame[config.source_id_column].isin(outer_val_ids)].reset_index(drop=True)
+        print(f"[nested] outer_train={len(outer_train_df)} rows | outer_val={len(outer_val_df)} rows")
 
-        inner_split_config = split_manifest.SplitConfig(
-            n_splits=config.inner_n_splits,
+        search_split_config = split_manifest.SplitConfig(
+            n_splits=config.search_n_splits,
             random_state=config.inner_random_state,
             shuffle=True,
             source_id_column=config.source_id_column,
             label_column=config.label_column,
             group_column=config.project_column,
         )
-        inner_cv_manifest = split_manifest.create_project_grouped_manifest(
+        search_manifest = split_manifest.create_project_grouped_manifest(
             outer_train_df[[config.source_id_column, config.label_column, config.project_column]],
-            config=inner_split_config,
+            config=search_split_config,
         )
+        search_train_ids = search_manifest.loc[search_manifest["fold"] != 0, config.source_id_column]
+        search_val_ids = search_manifest.loc[search_manifest["fold"] == 0, config.source_id_column]
+        search_train_df = outer_train_df[outer_train_df[config.source_id_column].isin(search_train_ids)]
+        search_val_df = outer_train_df[outer_train_df[config.source_id_column].isin(search_val_ids)]
+        print(f"[nested] rank search split: train={len(search_train_df)} rows | val={len(search_val_df)} rows")
 
-        rank_performance = {}
+        rank_performance = _load_search_checkpoint(output_dir, outer_fold_id) if resume else {}
+        if rank_performance:
+            print(f"[nested] resuming rank search, already have: {rank_performance}")
+
         for rank_candidate in config.rank_grid:
-            inner_praucs = []
-            for inner_fold in range(config.inner_n_splits):
-                inner_train_ids = inner_cv_manifest[inner_cv_manifest["fold"] != inner_fold][config.source_id_column]
-                inner_val_ids = inner_cv_manifest[inner_cv_manifest["fold"] == inner_fold][config.source_id_column]
-                inner_train_df = outer_train_df[outer_train_df[config.source_id_column].isin(inner_train_ids)]
-                inner_val_df = outer_train_df[outer_train_df[config.source_id_column].isin(inner_val_ids)]
+            if rank_candidate in rank_performance:
+                print(f"[nested] rank={rank_candidate}: already evaluated (PR-AUC={rank_performance[rank_candidate]:.4f}), skipping.")
+                continue
 
-                val_scores, tmp_model = train_lora_model(
-                    inner_train_df, inner_val_df, tokenizer, rank=rank_candidate,
-                    epochs=config.epochs, batch_size=config.train_batch_size,
-                    grad_accum_steps=config.grad_accum_steps, device=device,
-                    hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
-                    max_length=config.max_length,
-                )
-                prauc = average_precision_score(inner_val_df[config.label_column].values, val_scores)
-                inner_praucs.append(prauc)
+            rank_t0 = time.time()
+            print(f"[nested] --- evaluating rank candidate {rank_candidate} ---")
 
-                del tmp_model, inner_train_df, inner_val_df
-                gc.collect()
-                torch.cuda.empty_cache()
+            val_scores, tmp_model = train_lora_model(
+                search_train_df, search_val_df, tokenizer, rank=rank_candidate,
+                epochs=config.search_epochs, batch_size=config.train_batch_size,
+                grad_accum_steps=config.grad_accum_steps, device=device,
+                hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
+                max_length=config.max_length, log_prefix="    ",
+            )
+            prauc = float(average_precision_score(search_val_df[config.label_column].values, val_scores))
+            rank_performance[rank_candidate] = prauc
 
-            rank_performance[rank_candidate] = float(np.mean(inner_praucs))
-            if config.verbose:
-                print(f"    rank={rank_candidate} | inner mean PR-AUC={rank_performance[rank_candidate]:.4f}")
+            print(f"[nested] rank={rank_candidate} | PR-AUC={prauc:.4f} | {(time.time()-rank_t0)/60:.1f} min")
+
+            _save_search_checkpoint(output_dir, outer_fold_id, rank_performance)
+
+            del tmp_model
+            gc.collect()
+            torch.cuda.empty_cache()
 
         optimal_rank = max(rank_performance, key=rank_performance.get)
+        print(f"[nested] Selected rank={optimal_rank} for outer fold {outer_fold_id} | scores={rank_performance}")
 
+        print(f"[nested] --- final refit on full outer_train, rank={optimal_rank}, {config.epochs} epochs ---")
+        refit_t0 = time.time()
         outer_val_scores, final_outer_model = train_lora_model(
             outer_train_df, outer_val_df, tokenizer, rank=optimal_rank,
             epochs=config.epochs, batch_size=config.train_batch_size,
             grad_accum_steps=config.grad_accum_steps, device=device,
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
-            max_length=config.max_length,
+            max_length=config.max_length, log_prefix="    ",
         )
+        print(f"[nested] refit done in {(time.time()-refit_t0)/60:.1f} min")
 
         fold_oof = pd.DataFrame({
             config.source_id_column: outer_val_df[config.source_id_column].values,
@@ -208,7 +246,7 @@ def run_exp4_nested_rank(
             "fold": outer_fold_id,
         })
 
-        selected_row = {"outer_fold_id": outer_fold_id, "selected_rank": optimal_rank}
+        selected_row = {"outer_fold_id": outer_fold_id, "selected_rank": optimal_rank, "search_scores": rank_performance}
         training_row = {
             "outer_fold_id": outer_fold_id,
             "selected_rank": optimal_rank,
@@ -219,6 +257,7 @@ def run_exp4_nested_rank(
 
         if outer_fold_id == fold_ids[-1]:
             final_outer_model.save_pretrained(output_dir / "final_exp4_lora_adapter")
+            print(f"[nested] saved final fold LoRA adapter to {output_dir / 'final_exp4_lora_adapter'}")
 
         _write_outer_checkpoint(output_dir, outer_fold_id, fold_oof, selected_row, training_row)
 
@@ -229,12 +268,11 @@ def run_exp4_nested_rank(
 
         _update_run_state(state_path, completed_folds, status="running")
 
-        del outer_train_df, outer_val_df, final_outer_model
+        del outer_train_df, outer_val_df, search_train_df, search_val_df, final_outer_model
         gc.collect()
         torch.cuda.empty_cache()
 
-        if config.verbose:
-            print(f"[nested] Outer fold {outer_fold_id} done in {training_row['elapsed_minutes']:.1f} min | checkpoint saved")
+        print(f"[nested] Outer fold {outer_fold_id} done in {training_row['elapsed_minutes']:.1f} min | checkpoint saved | total elapsed {(time.time()-t0)/60:.1f} min")
 
     oof_predictions = pd.concat(oof_parts, axis=0).reset_index(drop=True)
 
@@ -265,6 +303,8 @@ def run_exp4_nested_rank(
 
     _update_run_state(state_path, completed_folds, status="completed")
 
+    print(f"\n[nested] EXP-4 nested rank search complete in {(time.time()-t0)/60:.1f} min")
+
     return {
         "oof_predictions": oof_predictions,
         "evaluation": eval_results,
@@ -287,14 +327,18 @@ def run_exp4_canonical_retrain(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"[canonical] Retraining on full development set ({len(development_frame)} rows), rank={selected_rank}, {config.epochs} epochs")
+    t0 = time.time()
+
     holdout_scores, global_model = train_lora_model(
         development_frame, holdout_frame, tokenizer, rank=selected_rank,
         epochs=config.epochs, batch_size=config.train_batch_size,
         grad_accum_steps=config.grad_accum_steps, device=device,
         hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
-        max_length=config.max_length,
+        max_length=config.max_length, log_prefix="  ",
     )
     global_model.save_pretrained(output_dir / "final_canonical_lora_model")
+    print(f"[canonical] Done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_lora_model'}")
 
     holdout_predictions = pd.DataFrame({
         config.source_id_column: holdout_frame[config.source_id_column].values,

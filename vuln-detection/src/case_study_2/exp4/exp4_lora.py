@@ -23,6 +23,8 @@ def train_lora_model(
     code_column="normalized_code",
     max_length=512,
     verbose=True,
+    log_every_steps=50,
+    log_prefix="",
 ):
     train_loader = create_dataloader(
         train_df, tokenizer, batch_size=batch_size, max_length=max_length,
@@ -37,14 +39,17 @@ def train_lora_model(
 
     is_cuda = (device == "cuda") or (hasattr(device, "type") and device.type == "cuda")
 
+    total_steps_per_epoch = -(-len(train_df) // batch_size)
+
     if verbose:
         stats = count_trainable_parameters(model)
         print(
-            f"    [lora] rank={rank} | trainable={stats['trainable_parameters']:,} "
+            f"{log_prefix}[lora] rank={rank} | train_rows={len(train_df)} | val_rows={len(val_df)} | "
+            f"steps/epoch={total_steps_per_epoch} | trainable={stats['trainable_parameters']:,} "
             f"({stats['trainable_percent']:.3f}%) | total={stats['total_parameters']:,}"
         )
         if is_cuda:
-            print(f"    [lora] VRAM after model load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+            print(f"{log_prefix}[lora] VRAM after model load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     pos_weight = get_class_weights(train_df).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -56,6 +61,7 @@ def train_lora_model(
         model.train()
         epoch_loss = 0.0
         n_steps = 0
+        epoch_t0 = time.time()
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
@@ -75,16 +81,31 @@ def train_lora_model(
                 optimizer.step()
                 optimizer.zero_grad()
 
+            if verbose and log_every_steps and (step + 1) % log_every_steps == 0:
+                elapsed_min = (time.time() - epoch_t0) / 60
+                steps_left = total_steps_per_epoch - (step + 1)
+                rate = (step + 1) / max(elapsed_min, 1e-6)
+                eta_min = steps_left / max(rate, 1e-6)
+                print(
+                    f"{log_prefix}[lora] epoch {epoch+1}/{epochs} step {step+1}/{total_steps_per_epoch} | "
+                    f"avg_loss_so_far={epoch_loss/max(n_steps,1):.4f} | "
+                    f"elapsed={elapsed_min:.1f} min | ETA epoch ~{eta_min:.1f} min"
+                )
+
         optimizer.step()
         optimizer.zero_grad()
 
         if verbose:
             elapsed_min = (time.time() - t0) / 60
+            epoch_min = (time.time() - epoch_t0) / 60
             peak_vram = torch.cuda.max_memory_allocated() / 1e9 if is_cuda else 0.0
             print(
-                f"    [lora] epoch {epoch+1}/{epochs} | avg_loss={epoch_loss/max(n_steps,1):.4f} "
-                f"| elapsed={elapsed_min:.1f} min | peak_VRAM={peak_vram:.2f} GB"
+                f"{log_prefix}[lora] epoch {epoch+1}/{epochs} done | avg_loss={epoch_loss/max(n_steps,1):.4f} "
+                f"| epoch_time={epoch_min:.1f} min | total_elapsed={elapsed_min:.1f} min | peak_VRAM={peak_vram:.2f} GB"
             )
+
+    if verbose:
+        print(f"{log_prefix}[lora] training done, scoring validation set ({len(val_df)} rows)...")
 
     model.eval()
     all_scores = []
