@@ -15,8 +15,8 @@ def train_lora_model(
     val_df,
     tokenizer,
     rank,
-    epochs=3,
-    batch_size=16,
+    epochs=2,
+    batch_size=64,
     grad_accum_steps=2,
     device="cuda",
     hf_cache_dir=None,
@@ -28,11 +28,11 @@ def train_lora_model(
 ):
     train_loader = create_dataloader(
         train_df, tokenizer, batch_size=batch_size, max_length=max_length,
-        shuffle=True, num_workers=2, code_column=code_column,
+        shuffle=True, num_workers=4, code_column=code_column,
     )
     val_loader = create_dataloader(
         val_df, tokenizer, batch_size=32, max_length=max_length,
-        shuffle=False, num_workers=2, code_column=code_column,
+        shuffle=False, num_workers=4, code_column=code_column,
     )
 
     model = get_lora_model(model_name=DEFAULT_CODE_MODEL, rank=rank, lora_alpha=16).to(device)

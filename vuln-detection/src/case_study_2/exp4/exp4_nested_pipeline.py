@@ -24,12 +24,12 @@ from case_study_1.evaluation import EvaluationConfig
 from case_study_1.confidence_intervals import bootstrap_metric_ci, format_ci_report
 
 
-EXP4_VERSION = "cs2-exp4-codeberta-lora-v1"
+EXP4_VERSION = "cs2-exp4-lora-v1"
 
 
 @dataclass(frozen=True)
 class Exp4Config:
-    experiment_name: str = "cs2_exp4_codeberta_lora"
+    experiment_name: str = "cs2_exp4_lora"
 
     code_column: str = "normalized_code"
     source_id_column: str = "source_row_id"
@@ -39,9 +39,9 @@ class Exp4Config:
 
     hf_cache_dir: Optional[str] = None
     max_length: int = 512
-    train_batch_size: int = 16
+    train_batch_size: int = 64
     grad_accum_steps: int = 2
-    epochs: int = 3
+    epochs: int = 2
 
     rank_grid: Tuple[int, ...] = (8, 16)
     inner_n_splits: int = 3
