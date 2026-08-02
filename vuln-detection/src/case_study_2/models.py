@@ -19,6 +19,12 @@ def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
         hf_cache_dir = str(hf_cache_dir)
         os.environ.setdefault("HF_HOME", hf_cache_dir)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(hf_cache_dir) / "hub"))
+    
+    # Pesca automaticamente HF_TOKEN se lo hai impostato nel notebook
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -53,6 +59,7 @@ def load_code_tokenizer(
         tokenizer_name,
         use_fast=True,
         cache_dir=hf_cache_dir,
+        token=os.environ.get("HF_TOKEN"),  # <--- Pesca il token dall'ambiente
     )
 
 
@@ -67,7 +74,10 @@ def load_code_encoder(
     configure_huggingface_cache(hf_cache_dir)
     dtype = _dtype_from_policy(dtype_policy, device)
 
-    kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir}
+    kwargs: Dict[str, Any] = {
+        "cache_dir": hf_cache_dir,
+        "token": os.environ.get("HF_TOKEN"),  # <--- Pesca il token dall'ambiente
+    }
     if dtype is not None:
         kwargs["dtype"] = dtype
 
