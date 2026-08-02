@@ -69,7 +69,7 @@ def load_code_encoder(
 
     kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir}
     if dtype is not None:
-        kwargs["torch_dtype"] = dtype
+        kwargs["dtype"] = dtype
 
     model = AutoModel.from_pretrained(model_name, **kwargs)
     model.to(device)
