@@ -198,3 +198,73 @@ def get_lora_model(model_name: str = DEFAULT_CODE_MODEL, rank: int = 8, lora_alp
         lora_alpha=lora_alpha,
         pooling=pooling,
     )
+
+# =====================================================================
+# EXP-5: HEFT (Hierarchical Efficient Fine-Tuning: LoRA + ReFT)
+# =====================================================================
+
+def create_heft_sequence_classifier(
+    model_name: str = DEFAULT_CODE_MODEL,
+    lora_rank: int = 8,
+    reft_rank: int = 4,
+    layer_target: int = 4,
+    pooling: str = "mean",
+    dtype_policy: str = "auto",
+    hf_cache_dir: Optional[str] = None,
+):
+    from peft import LoraConfig, get_peft_model
+    import pyreft
+
+    # 1. Build base Sequence Classifier
+    base = CodeSequenceClassifier(
+        model_name=model_name,
+        freeze_backbone=False,
+        pooling=pooling,
+        dtype_policy=dtype_policy,
+        hf_cache_dir=hf_cache_dir,
+    )
+
+    # 2. Apply Weight-Space Adaptation (LoRA via PEFT)
+    target_modules = infer_lora_target_modules(base)
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_rank * 2,
+        target_modules=target_modules,
+        bias="none",
+        task_type="FEATURE_EXTRACTION",
+    )
+    lora_model = get_peft_model(base, lora_config)
+
+    # 3. Apply Representation-Space Refinement (ReFT via PyReFT)
+    hidden_size = int(base.backbone.config.hidden_size)
+    reft_config = pyreft.ReftConfig(
+        representations={
+            "layer": layer_target,
+            "component": "block_output",
+            "low_rank_dimension": reft_rank,
+            "intervention": pyreft.LoreftIntervention(
+                embed_dim=hidden_size,
+                low_rank_dimension=reft_rank,
+            ),
+        }
+    )
+
+    # Wrap the LoRA model into PyReFT to achieve the HEFT hierarchy
+    heft_model = pyreft.get_reft_model(lora_model, reft_config)
+    return heft_model
+
+
+def get_heft_model(
+    model_name: str = DEFAULT_CODE_MODEL,
+    lora_rank: int = 8,
+    reft_rank: int = 4,
+    layer_target: int = 4,
+    pooling: str = "mean",
+):
+    return create_heft_sequence_classifier(
+        model_name=model_name,
+        lora_rank=lora_rank,
+        reft_rank=reft_rank,
+        layer_target=layer_target,
+        pooling=pooling,
+    )
