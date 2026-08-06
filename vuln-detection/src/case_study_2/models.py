@@ -247,8 +247,9 @@ def create_heft_sequence_classifier(
     # 4. Fine Representation Steering (ReFT)
     hidden_size = int(base.backbone.config.hidden_size)
     
-    # Infer layer module format (CodeBERTa / RoBERTa standard: roberta.encoder.layer[x].output)
-    component_name = f"roberta.encoder.layer[{layer_target}].output"
+    # Standard PyReft target abstraction (block_output) over backbone
+    # Or route directly through the backbone module path:
+    component_name = f"backbone.encoder.layer[{layer_target}].output"
 
     reft_config = pyreft.ReftConfig(
         representations=[
@@ -266,23 +267,3 @@ def create_heft_sequence_classifier(
 
     heft_model = pyreft.get_reft_model(lora_model, reft_config)
     return heft_model
-
-
-def get_heft_model(
-    model_name: str = DEFAULT_CODE_MODEL,
-    rank: int = 8,
-    reft_rank: int = 4,
-    layer_target: int = 4,
-    heft_alpha: int = 16,
-    pooling: str = "mean",
-    freeze_lora: bool = True,
-):
-    return create_heft_sequence_classifier(
-        model_name=model_name,
-        rank=rank,
-        reft_rank=reft_rank,
-        layer_target=layer_target,
-        lora_alpha=heft_alpha,
-        pooling=pooling,
-        freeze_lora=freeze_lora,
-    )
