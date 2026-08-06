@@ -17,19 +17,26 @@ def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
         batch_size, seq_len = input_ids.shape
         num_interventions = len(model.interventions)
 
-        # Create locations directly: shape (num_interventions, batch_size, seq_len, 1)
-        locations = (
-            torch.arange(seq_len, device=input_ids.device)
-            .unsqueeze(0)
-            .repeat(batch_size, 1)
-            .unsqueeze(0)
-            .repeat(num_interventions, 1, 1)
-            .unsqueeze(-1)
+        # PyReft helper with all required keys
+        unit_locations = pyreft.get_intervention_locations(
+            last_position=seq_len,
+            first_n=0,
+            last_n=seq_len,
+            pad_mode="first",
+            num_interventions=num_interventions,
+            share_weights=True,
         )
+
+        # Ensure locations are on the correct device and match batch size
+        if isinstance(unit_locations, torch.Tensor):
+            unit_locations = unit_locations.to(input_ids.device)
+            if unit_locations.ndim == 2:
+                # Shape: (batch_size, seq_len) -> (num_interventions, batch_size, seq_len, 1)
+                unit_locations = unit_locations.unsqueeze(0).repeat(num_interventions, 1, 1).unsqueeze(-1)
 
         outputs = model(
             base={"input_ids": input_ids, "attention_mask": attention_mask},
-            unit_locations={"sources->base": locations},
+            unit_locations={"sources->base": unit_locations},
         )
 
         if isinstance(outputs, (tuple, list)):
