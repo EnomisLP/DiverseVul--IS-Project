@@ -121,6 +121,11 @@ class CodeSequenceClassifier(nn.Module):
         """Expose the underlying backbone config to pyreft/peft."""
         return self.backbone.config
 
+    @property
+    def device(self) -> torch.device:
+        """Expose the device where parameters reside for pyreft."""
+        return next(self.parameters()).device
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden = outputs.last_hidden_state
