@@ -28,6 +28,9 @@ def train_heft_model(
     verbose=True,
     log_every_steps=50,
     log_prefix="",
+    reft_rank=4,
+    layer_target=4,
+    heft_alpha=16,
 ):
     train_loader = create_dataloader(
         train_df, tokenizer, batch_size=batch_size, max_length=max_length,
@@ -38,8 +41,13 @@ def train_heft_model(
         shuffle=False, num_workers=num_workers, code_column=code_column,
     )
 
-    # Assuming a get_heft_model exists in models.py with a similar signature
-    model = get_heft_model(model_name=DEFAULT_CODE_MODEL, rank=rank, heft_alpha=16).to(device)
+    model = get_heft_model(
+        model_name=DEFAULT_CODE_MODEL,
+        rank=rank,
+        reft_rank=reft_rank,
+        layer_target=layer_target,
+        heft_alpha=heft_alpha,
+    ).to(device)
 
     is_cuda = (device == "cuda") or (hasattr(device, "type") and device.type == "cuda")
 
@@ -48,7 +56,8 @@ def train_heft_model(
     if verbose:
         stats = count_trainable_parameters(model)
         print(
-            f"{log_prefix}[heft] rank={rank} | train_rows={len(train_df)} | val_rows={len(val_df)} | "
+            f"{log_prefix}[heft] rank={rank} (reft_r={reft_rank}, layer={layer_target}) | "
+            f"train_rows={len(train_df)} | val_rows={len(val_df)} | "
             f"batch_size={batch_size} | grad_accum={grad_accum_steps} | steps/epoch={total_steps_per_epoch} | "
             f"trainable={stats['trainable_parameters']:,} ({stats['trainable_percent']:.3f}%) | "
             f"total={stats['total_parameters']:,}"
@@ -75,7 +84,7 @@ def train_heft_model(
             labels = batch["label"].to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = criterion(logits, labels) / grad_accum_steps
 
             loss.backward()
@@ -97,8 +106,9 @@ def train_heft_model(
                     f"elapsed={elapsed_min:.1f} min | ETA epoch ~{eta_min:.1f} min"
                 )
 
-        optimizer.step()
-        optimizer.zero_grad()
+        if n_steps > 0 and n_steps % grad_accum_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         if verbose:
             elapsed_min = (time.time() - t0) / 60
@@ -119,7 +129,7 @@ def train_heft_model(
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 scores = torch.sigmoid(logits)
             all_scores.extend(scores.float().cpu().numpy())
 

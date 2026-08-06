@@ -6,9 +6,8 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -44,6 +43,9 @@ class Exp5Config:
     epochs: int = 3
 
     rank_grid: Tuple[int, ...] = (8, 16)
+    reft_rank: int = 4
+    layer_target: int = 4
+    
     inner_n_splits: int = 3
     inner_random_state: int = 20260707
     decision_threshold: float = 0.50
@@ -216,6 +218,7 @@ def run_exp5_nested_rank(
                 num_workers=config.num_workers, device=device,
                 hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
                 max_length=config.max_length, log_prefix="    ",
+                reft_rank=config.reft_rank, layer_target=config.layer_target,
             )
             prauc = float(average_precision_score(search_val_df[config.label_column].values, val_scores))
             rank_performance[rank_candidate] = prauc
@@ -240,6 +243,7 @@ def run_exp5_nested_rank(
             num_workers=config.num_workers, device=device,
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
             max_length=config.max_length, log_prefix="    ",
+            reft_rank=config.reft_rank, layer_target=config.layer_target,
         )
         print(f"[nested] refit done in {(time.time()-refit_t0)/60:.1f} min")
 
@@ -342,6 +346,7 @@ def run_exp5_canonical_retrain(
         num_workers=config.num_workers, device=device,
         hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
         max_length=config.max_length, log_prefix="  ",
+        reft_rank=config.reft_rank, layer_target=config.layer_target,
     )
     global_model.save_pretrained(output_dir / "final_canonical_heft_model")
     print(f"[canonical] Done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_heft_model'}")

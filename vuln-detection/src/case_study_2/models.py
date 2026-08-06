@@ -19,12 +19,6 @@ def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
         hf_cache_dir = str(hf_cache_dir)
         os.environ.setdefault("HF_HOME", hf_cache_dir)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(hf_cache_dir) / "hub"))
-    
-    # Pesca automaticamente HF_TOKEN se lo hai impostato nel notebook
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        os.environ["HF_TOKEN"] = hf_token
-
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -59,7 +53,6 @@ def load_code_tokenizer(
         tokenizer_name,
         use_fast=True,
         cache_dir=hf_cache_dir,
-        token=os.environ.get("HF_TOKEN"),  # <--- Pesca il token dall'ambiente
     )
 
 
@@ -74,12 +67,9 @@ def load_code_encoder(
     configure_huggingface_cache(hf_cache_dir)
     dtype = _dtype_from_policy(dtype_policy, device)
 
-    kwargs: Dict[str, Any] = {
-        "cache_dir": hf_cache_dir,
-        "token": os.environ.get("HF_TOKEN"),  # <--- Pesca il token dall'ambiente
-    }
+    kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir}
     if dtype is not None:
-        kwargs["dtype"] = dtype
+        kwargs["torch_dtype"] = dtype
 
     model = AutoModel.from_pretrained(model_name, **kwargs)
     model.to(device)
@@ -134,7 +124,11 @@ class CodeSequenceClassifier(nn.Module):
         else:
             pooled = mean_pool_last_hidden(hidden, attention_mask)
         logits = self.classification_head(pooled)
-        return logits.squeeze(-1)
+        
+        # Safely squeeze dim -1 only if 2D tensor and single output label
+        if logits.ndim > 1 and logits.size(-1) == 1:
+            return logits.squeeze(-1)
+        return logits
 
 
 def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
@@ -187,6 +181,7 @@ def create_lora_sequence_classifier(
         lora_dropout=lora_dropout,
         bias="none",
         task_type="FEATURE_EXTRACTION",
+        modules_to_save=["classification_head"],
     )
     return get_peft_model(base, config)
 
@@ -199,23 +194,33 @@ def get_lora_model(model_name: str = DEFAULT_CODE_MODEL, rank: int = 8, lora_alp
         pooling=pooling,
     )
 
+
 # =====================================================================
 # EXP-5: HEFT (Hierarchical Efficient Fine-Tuning: LoRA + ReFT)
 # =====================================================================
 
+def freeze_lora_parameters(model: nn.Module) -> None:
+    """Freezes LoRA adapter parameters so only ReFT learns during Phase 2."""
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = False
+
+
 def create_heft_sequence_classifier(
     model_name: str = DEFAULT_CODE_MODEL,
-    lora_rank: int = 8,
+    rank: int = 8,
     reft_rank: int = 4,
     layer_target: int = 4,
+    lora_alpha: int = 16,
     pooling: str = "mean",
     dtype_policy: str = "auto",
     hf_cache_dir: Optional[str] = None,
+    freeze_lora: bool = True,
 ):
     from peft import LoraConfig, get_peft_model
     import pyreft
 
-    # 1. Build base Sequence Classifier
+    # 1. Base Classifier
     base = CodeSequenceClassifier(
         model_name=model_name,
         freeze_backbone=False,
@@ -224,18 +229,23 @@ def create_heft_sequence_classifier(
         hf_cache_dir=hf_cache_dir,
     )
 
-    # 2. Apply Weight-Space Adaptation (LoRA via PEFT)
+    # 2. Coarse Weight Adaptation (LoRA)
     target_modules = infer_lora_target_modules(base)
     lora_config = LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_rank * 2,
+        r=rank,
+        lora_alpha=lora_alpha,
         target_modules=target_modules,
         bias="none",
         task_type="FEATURE_EXTRACTION",
+        modules_to_save=["classification_head"],
     )
     lora_model = get_peft_model(base, lora_config)
 
-    # 3. Apply Representation-Space Refinement (ReFT via PyReFT)
+    # 3. Freeze LoRA weights to establish coarse-to-fine hierarchy (Hill 2025)
+    if freeze_lora:
+        freeze_lora_parameters(lora_model)
+
+    # 4. Fine Representation Steering (ReFT)
     hidden_size = int(base.backbone.config.hidden_size)
     reft_config = pyreft.ReftConfig(
         representations={
@@ -249,22 +259,25 @@ def create_heft_sequence_classifier(
         }
     )
 
-    # Wrap the LoRA model into PyReFT to achieve the HEFT hierarchy
     heft_model = pyreft.get_reft_model(lora_model, reft_config)
     return heft_model
 
 
 def get_heft_model(
     model_name: str = DEFAULT_CODE_MODEL,
-    lora_rank: int = 8,
+    rank: int = 8,
     reft_rank: int = 4,
     layer_target: int = 4,
+    heft_alpha: int = 16,
     pooling: str = "mean",
+    freeze_lora: bool = True,
 ):
     return create_heft_sequence_classifier(
         model_name=model_name,
-        lora_rank=lora_rank,
+        rank=rank,
         reft_rank=reft_rank,
         layer_target=layer_target,
+        lora_alpha=heft_alpha,
         pooling=pooling,
+        freeze_lora=freeze_lora,
     )
