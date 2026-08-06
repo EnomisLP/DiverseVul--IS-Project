@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 import numpy as np
-
+import pyreft
 from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import get_heft_model, count_trainable_parameters, DEFAULT_CODE_MODEL
 
@@ -16,33 +16,35 @@ def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
     if hasattr(model, "interventions"):
         batch_size, seq_len = input_ids.shape
         
-        # PyReft expects explicit location specs per batch item.
-        # Format: [[[pos_0, pos_1, ...]]] for each element in batch
-        # To target all tokens across sequence:
-        unit_locations = {
-            "sources->middle": [[[i for i in range(seq_len)]] for _ in range(batch_size)]
-        }
-        
-        outputs = model(
-            base={"input_ids": input_ids, "attention_mask": attention_mask},
-            unit_locations=unit_locations,
+        # Helper generates valid pyvene locations for all tokens in batch
+        unit_locations = pyreft.get_intervention_locations(
+            last_position=seq_len,
+            first_position=0,
+            num_targets=1,
+            num_transformations=len(model.interventions),
+            batch_size=batch_size,
         )
         
-        # PyReft returns a tuple: (interventions, base_outputs)
+        # Move generated tensor locations to current device
+        if isinstance(unit_locations, torch.Tensor):
+            unit_locations = unit_locations.to(input_ids.device)
+            
+        outputs = model(
+            base={"input_ids": input_ids, "attention_mask": attention_mask},
+            unit_locations={"sources->base": unit_locations},
+        )
+        
         if isinstance(outputs, (tuple, list)):
             logits = outputs[1]
         else:
             logits = getattr(outputs, "logits", outputs)
     else:
-        # Standard PyTorch/PEFT forward call
         logits = model(input_ids=input_ids, attention_mask=attention_mask)
 
-    # Ensure output is flattened if single output label (shape: [B, 1] -> [B])
     if logits.ndim > 1 and logits.size(-1) == 1:
         logits = logits.squeeze(-1)
 
     return logits
-
 
 def train_heft_model(
     train_df,
