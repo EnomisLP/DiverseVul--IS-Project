@@ -13,14 +13,22 @@ from case_study_2.models import get_heft_model, count_trainable_parameters, DEFA
 
 def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """Safely executes the forward pass for either standard or PyReft/PyVene wrapped models."""
-    # Check if the model is wrapped by PyReft / PyVene
     if hasattr(model, "interventions"):
-        # PyReft expects base model inputs passed inside a dictionary under 'base'
+        batch_size, seq_len = input_ids.shape
+        
+        # PyReft expects explicit location specs per batch item.
+        # Format: [[[pos_0, pos_1, ...]]] for each element in batch
+        # To target all tokens across sequence:
+        unit_locations = {
+            "sources->middle": [[[i for i in range(seq_len)]] for _ in range(batch_size)]
+        }
+        
         outputs = model(
             base={"input_ids": input_ids, "attention_mask": attention_mask},
-            unit_locations={"sources->middle": None},
+            unit_locations=unit_locations,
         )
-        # PyReft returns a tuple: (interventions, logits/outputs)
+        
+        # PyReft returns a tuple: (interventions, base_outputs)
         if isinstance(outputs, (tuple, list)):
             logits = outputs[1]
         else:
@@ -29,7 +37,7 @@ def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
         # Standard PyTorch/PEFT forward call
         logits = model(input_ids=input_ids, attention_mask=attention_mask)
 
-    # Ensure output is flattened if binary classification (logits shape: [B, 1] -> [B])
+    # Ensure output is flattened if single output label (shape: [B, 1] -> [B])
     if logits.ndim > 1 and logits.size(-1) == 1:
         logits = logits.squeeze(-1)
 
