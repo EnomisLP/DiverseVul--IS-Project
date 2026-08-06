@@ -125,7 +125,6 @@ class CodeSequenceClassifier(nn.Module):
             pooled = mean_pool_last_hidden(hidden, attention_mask)
         logits = self.classification_head(pooled)
         
-        # Safely squeeze dim -1 only if 2D tensor and single output label
         if logits.ndim > 1 and logits.size(-1) == 1:
             return logits.squeeze(-1)
         return logits
@@ -241,22 +240,28 @@ def create_heft_sequence_classifier(
     )
     lora_model = get_peft_model(base, lora_config)
 
-    # 3. Freeze LoRA weights to establish coarse-to-fine hierarchy (Hill 2025)
+    # 3. Freeze LoRA weights to establish coarse-to-fine hierarchy
     if freeze_lora:
         freeze_lora_parameters(lora_model)
 
     # 4. Fine Representation Steering (ReFT)
     hidden_size = int(base.backbone.config.hidden_size)
+    
+    # Infer layer module format (CodeBERTa / RoBERTa standard: roberta.encoder.layer[x].output)
+    component_name = f"roberta.encoder.layer[{layer_target}].output"
+
     reft_config = pyreft.ReftConfig(
-        representations={
-            "layer": layer_target,
-            "component": "block_output",
-            "low_rank_dimension": reft_rank,
-            "intervention": pyreft.LoreftIntervention(
-                embed_dim=hidden_size,
-                low_rank_dimension=reft_rank,
-            ),
-        }
+        representations=[
+            {
+                "layer": layer_target,
+                "component": component_name,
+                "low_rank_dimension": reft_rank,
+                "intervention": pyreft.LoreftIntervention(
+                    embed_dim=hidden_size,
+                    low_rank_dimension=reft_rank,
+                ),
+            }
+        ]
     )
 
     heft_model = pyreft.get_reft_model(lora_model, reft_config)
