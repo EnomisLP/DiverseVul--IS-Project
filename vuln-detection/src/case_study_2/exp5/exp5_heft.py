@@ -11,6 +11,31 @@ from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import get_heft_model, count_trainable_parameters, DEFAULT_CODE_MODEL
 
 
+def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Safely executes the forward pass for either standard or PyReft/PyVene wrapped models."""
+    # Check if the model is wrapped by PyReft / PyVene
+    if hasattr(model, "interventions"):
+        # PyReft expects base model inputs passed inside a dictionary under 'base'
+        outputs = model(
+            base={"input_ids": input_ids, "attention_mask": attention_mask},
+            unit_locations={"sources->middle": None},
+        )
+        # PyReft returns a tuple: (interventions, logits/outputs)
+        if isinstance(outputs, (tuple, list)):
+            logits = outputs[1]
+        else:
+            logits = getattr(outputs, "logits", outputs)
+    else:
+        # Standard PyTorch/PEFT forward call
+        logits = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    # Ensure output is flattened if binary classification (logits shape: [B, 1] -> [B])
+    if logits.ndim > 1 and logits.size(-1) == 1:
+        logits = logits.squeeze(-1)
+
+    return logits
+
+
 def train_heft_model(
     train_df,
     val_df,
@@ -67,7 +92,10 @@ def train_heft_model(
 
     pos_weight = get_class_weights(train_df).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = AdamW(model.parameters(), lr=2e-4)
+
+    # Filter trainable parameters for AdamW optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=2e-4)
 
     t0 = time.time()
 
@@ -84,8 +112,8 @@ def train_heft_model(
             labels = batch["label"].to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = criterion(logits, labels) / grad_accum_steps
+                logits = forward_heft(model, input_ids, attention_mask)
+                loss = criterion(logits, labels.float()) / grad_accum_steps
 
             loss.backward()
             epoch_loss += loss.item() * grad_accum_steps
@@ -129,7 +157,7 @@ def train_heft_model(
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = forward_heft(model, input_ids, attention_mask)
                 scores = torch.sigmoid(logits)
             all_scores.extend(scores.float().cpu().numpy())
 
