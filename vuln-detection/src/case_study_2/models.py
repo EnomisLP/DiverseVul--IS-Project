@@ -116,6 +116,11 @@ class CodeSequenceClassifier(nn.Module):
         self.classification_head = nn.Linear(hidden_size, num_labels)
         self.pooling = pooling
 
+    @property
+    def config(self):
+        """Expose the underlying backbone config to pyreft/peft."""
+        return self.backbone.config
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden = outputs.last_hidden_state
