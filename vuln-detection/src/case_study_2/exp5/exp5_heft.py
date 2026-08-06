@@ -15,25 +15,28 @@ def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
     """Safely executes the forward pass for either standard or PyReft/PyVene wrapped models."""
     if hasattr(model, "interventions"):
         batch_size, seq_len = input_ids.shape
-        
-        # Helper generates valid pyvene locations for all tokens in batch
+        num_interventions = len(model.interventions)
+
+        # PyReft location helper using correct keyword arguments
         unit_locations = pyreft.get_intervention_locations(
-            last_position=seq_len,
-            first_position=0,
-            num_targets=1,
-            num_transformations=len(model.interventions),
-            batch_size=batch_size,
+            first_n=0,
+            last_n=seq_len,
+            pad_mode="first",
+            num_interventions=num_interventions,
+            share_weights=True,
         )
-        
-        # Move generated tensor locations to current device
+
+        # Ensure location tensors match batch size and device
         if isinstance(unit_locations, torch.Tensor):
             unit_locations = unit_locations.to(input_ids.device)
-            
+            if unit_locations.shape[0] != batch_size:
+                unit_locations = unit_locations.repeat(batch_size, 1, 1)
+
         outputs = model(
             base={"input_ids": input_ids, "attention_mask": attention_mask},
             unit_locations={"sources->base": unit_locations},
         )
-        
+
         if isinstance(outputs, (tuple, list)):
             logits = outputs[1]
         else:
