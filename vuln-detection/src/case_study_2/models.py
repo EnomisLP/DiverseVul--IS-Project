@@ -238,7 +238,7 @@ def create_heft_sequence_classifier(
         hf_cache_dir=hf_cache_dir,
     )
 
-    # 2. Coarse Weight Adaptation (LoRA)
+    # 2. Apply LoRA
     target_modules = infer_lora_target_modules(base)
     lora_config = LoraConfig(
         r=rank,
@@ -250,32 +250,32 @@ def create_heft_sequence_classifier(
     )
     lora_model = get_peft_model(base, lora_config)
 
-    # 3. Freeze LoRA weights to establish coarse-to-fine hierarchy
     if freeze_lora:
         freeze_lora_parameters(lora_model)
 
-    # 4. Fine Representation Steering (ReFT)
     hidden_size = int(base.backbone.config.hidden_size)
-    
-    # Standard PyReft target abstraction (block_output) over backbone
-    # Or route directly through the backbone module path:
-    component_name = f"backbone.encoder.layer[{layer_target}].output"
 
+    # 3. Explicit Representation Config targeting the backbone encoder
     reft_config = pyreft.ReftConfig(
         representations=[
-            {
-                "layer": layer_target,
-                "component": component_name,
-                "low_rank_dimension": reft_rank,
-                "intervention": pyreft.LoreftIntervention(
+            pyreft.RepresentationConfig(
+                layer=layer_target,
+                component=f"backbone.encoder.layer[{layer_target}].output",
+                low_rank_dimension=reft_rank,
+                intervention=pyreft.LoreftIntervention(
                     embed_dim=hidden_size,
                     low_rank_dimension=reft_rank,
                 ),
-            }
+            )
         ]
     )
 
-    heft_model = pyreft.get_reft_model(lora_model, reft_config)
+    # Set set_device=False to prevent PyReft from probing custom module properties during init
+    heft_model = pyreft.get_reft_model(lora_model, reft_config, set_device=False)
+    
+    # Force PyVene to single-stream / direct intervention mode (bypasses source-to-base requirement)
+    heft_model.mode = "single"
+    
     return heft_model
 
 def get_heft_model(

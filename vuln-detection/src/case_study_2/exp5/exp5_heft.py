@@ -12,37 +12,27 @@ from case_study_2.models import get_heft_model, count_trainable_parameters, DEFA
 
 
 def forward_heft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Safely executes the forward pass for either standard or PyReft/PyVene wrapped models."""
+    """Clean forward pass for HEFT Sequence Classification."""
     if hasattr(model, "interventions"):
         batch_size, seq_len = input_ids.shape
         num_interventions = len(model.interventions)
 
-        # PyReft helper with all required keys
-        unit_locations = pyreft.get_intervention_locations(
-            last_position=seq_len,
-            first_n=0,
-            last_n=seq_len,
-            pad_mode="first",
-            num_interventions=num_interventions,
-            share_weights=True,
+        # In "single" mode, unit_locations is a standard 3D position tensor:
+        # Shape: (num_interventions, batch_size, seq_len)
+        unit_locations = (
+            torch.arange(seq_len, device=input_ids.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+            .unsqueeze(0)
+            .repeat(num_interventions, 1, 1)
         )
-
-        # Ensure locations are on the correct device and match batch size
-        if isinstance(unit_locations, torch.Tensor):
-            unit_locations = unit_locations.to(input_ids.device)
-            if unit_locations.ndim == 2:
-                # Shape: (batch_size, seq_len) -> (num_interventions, batch_size, seq_len, 1)
-                unit_locations = unit_locations.unsqueeze(0).repeat(num_interventions, 1, 1).unsqueeze(-1)
 
         outputs = model(
             base={"input_ids": input_ids, "attention_mask": attention_mask},
-            unit_locations={"sources->base": unit_locations},
+            unit_locations=unit_locations,
         )
 
-        if isinstance(outputs, (tuple, list)):
-            logits = outputs[1]
-        else:
-            logits = getattr(outputs, "logits", outputs)
+        logits = outputs[1] if isinstance(outputs, (tuple, list)) else outputs
     else:
         logits = model(input_ids=input_ids, attention_mask=attention_mask)
 
