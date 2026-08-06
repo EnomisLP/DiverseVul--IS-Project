@@ -76,7 +76,7 @@ class NestedProbeConfig:
 
 def resolve_device(require_cuda: bool = True) -> str:
     if torch.cuda.is_available():
-        return "cuda"
+        return "cuda:0"
     if require_cuda:
         raise RuntimeError(
             "EXP-3 linear probe requires a CUDA GPU for embedding extraction."
@@ -97,7 +97,7 @@ def extract_embeddings(
     if cache_path is not None and cache_path.exists():
         return np.load(cache_path)
 
-    if device != "cuda":
+    if not str(device).startswith("cuda"):
         raise RuntimeError("extract_embeddings must run on a CUDA device.")
 
     frame = frame.reset_index(drop=True)
