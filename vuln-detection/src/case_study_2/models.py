@@ -267,3 +267,22 @@ def create_heft_sequence_classifier(
 
     heft_model = pyreft.get_reft_model(lora_model, reft_config)
     return heft_model
+
+def get_heft_model(
+    model_name: str = DEFAULT_CODE_MODEL,
+    rank: int = 8,
+    reft_rank: int = 4,
+    layer_target: int = 4,
+    heft_alpha: int = 16,
+    pooling: str = "mean",
+    freeze_lora: bool = True,
+):
+    return create_heft_sequence_classifier(
+        model_name=model_name,
+        rank=rank,
+        reft_rank=reft_rank,
+        layer_target=layer_target,
+        lora_alpha=heft_alpha,
+        pooling=pooling,
+        freeze_lora=freeze_lora,
+    )
