@@ -40,7 +40,8 @@ class Exp5Config:
     max_length: int = 512
     train_batch_size: int = 16
     grad_accum_steps: int = 2
-    epochs: int = 3
+    lora_epochs: int = 2
+    reft_epochs: int = 2
 
     rank_grid: Tuple[int, ...] = (8, 16)
     reft_rank: int = 4
@@ -148,7 +149,10 @@ def run_exp5_nested_rank(
 
     fold_ids = sorted(development_manifest[config.fold_column].unique().tolist())
     print(f"[nested] Starting EXP-5 nested rank search over {len(fold_ids)} outer folds, rank_grid={config.rank_grid}")
-    print(f"[nested] Search phase: {config.search_epochs} epoch(s), single held-out split | Refit phase: {config.epochs} epoch(s), full training")
+    print(
+        f"[nested] Search phase: {config.search_epochs} epoch(s)/phase, single held-out split | "
+        f"Refit phase: {config.lora_epochs} LoRA + {config.reft_epochs} ReFT epoch(s), full training"
+    )
 
     oof_parts = []
     selected_rows = []
@@ -213,7 +217,8 @@ def run_exp5_nested_rank(
 
             val_scores, tmp_model = train_heft_model_safe(
                 search_train_df, search_val_df, tokenizer, rank=rank_candidate,
-                epochs=config.search_epochs, batch_size=config.train_batch_size,
+                lora_epochs=config.search_epochs, reft_epochs=config.search_epochs,
+                batch_size=config.train_batch_size,
                 grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
                 num_workers=config.num_workers, device=device,
                 hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
@@ -234,11 +239,15 @@ def run_exp5_nested_rank(
         optimal_rank = max(rank_performance, key=rank_performance.get)
         print(f"[nested] Selected rank={optimal_rank} for outer fold {outer_fold_id} | scores={rank_performance}")
 
-        print(f"[nested] --- final refit on full outer_train, rank={optimal_rank}, {config.epochs} epochs ---")
+        print(
+            f"[nested] --- final refit on full outer_train, rank={optimal_rank}, "
+            f"{config.lora_epochs} LoRA + {config.reft_epochs} ReFT epochs ---"
+        )
         refit_t0 = time.time()
         outer_val_scores, final_outer_model = train_heft_model_safe(
             outer_train_df, outer_val_df, tokenizer, rank=optimal_rank,
-            epochs=config.epochs, batch_size=config.train_batch_size,
+            lora_epochs=config.lora_epochs, reft_epochs=config.reft_epochs,
+            batch_size=config.train_batch_size,
             grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
             num_workers=config.num_workers, device=device,
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
@@ -336,12 +345,16 @@ def run_exp5_canonical_retrain(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[canonical] Retraining on full development set ({len(development_frame)} rows), rank={selected_rank}, {config.epochs} epochs")
+    print(
+        f"[canonical] Retraining on full development set ({len(development_frame)} rows), "
+        f"rank={selected_rank}, {config.lora_epochs} LoRA + {config.reft_epochs} ReFT epochs"
+    )
     t0 = time.time()
 
     holdout_scores, global_model = train_heft_model_safe(
         development_frame, holdout_frame, tokenizer, rank=selected_rank,
-        epochs=config.epochs, batch_size=config.train_batch_size,
+        lora_epochs=config.lora_epochs, reft_epochs=config.reft_epochs,
+        batch_size=config.train_batch_size,
         grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
         num_workers=config.num_workers, device=device,
         hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,

@@ -205,62 +205,80 @@ def get_lora_model(model_name: str = DEFAULT_CODE_MODEL, rank: int = 8, lora_alp
 
 
 # =====================================================================
-# EXP-5: HEFT (Hierarchical Efficient Fine-Tuning: LoRA + ReFT)
+# EXP-5: HEFT (Hierarchical Efficient Fine-Tuning: LoRA -> freeze -> ReFT)
 # =====================================================================
+#
+# HEFT is a two-phase procedure:
+#   Phase 1 (LoRA): train a standard LoRA-adapted sequence classifier
+#                    (use get_lora_model() below, already defined above).
+#   Phase 2 (ReFT):  freeze *everything* learned in Phase 1 (LoRA adapters,
+#                    classification head, backbone) and train a LoReFT
+#                    intervention on top of the frozen, LoRA-adapted backbone
+#                    (use attach_reft_to_lora_model() below).
+#
+# These two builders are meant to be driven by the two-phase training loop in
+# exp5_heft.py -- they only construct models, they don't train anything.
 
 def freeze_lora_parameters(model: nn.Module) -> None:
-    """Freezes LoRA adapter parameters so only ReFT learns during Phase 2."""
+    """Freezes LoRA adapter parameters learned in Phase 1."""
     for name, param in model.named_parameters():
         if "lora_" in name:
             param.requires_grad = False
 
 
-def create_heft_sequence_classifier(
-    model_name: str = DEFAULT_CODE_MODEL,
-    rank: int = 8,
+def reft_component_path(layer_target: int) -> str:
+    """
+    Dotted/bracket component path pyreft needs to locate the target layer's
+    output *inside a peft-wrapped model*.
+
+    peft.get_peft_model() re-nests the original module tree under
+    "base_model.model.*" rather than preserving the original top-level
+    attribute names. pyreft/pyvene resolve `component` strings via
+    nn.Module.get_submodule(), which walks the *real* module registry (not
+    Python attribute-forwarding), so a path like
+    "backbone.encoder.layer[i].output" -- valid on the bare, unwrapped model --
+    does not exist once the model has been wrapped with LoRA, and pyreft will
+    fail to find it. It must be prefixed with "base_model.model." to match the
+    wrapped model's actual module tree. (This mirrors the pattern pyreft's own
+    docs use for peft-wrapped causal LMs: "base_model.model.model.layers[i]...".)
+    """
+    return f"base_model.model.backbone.encoder.layer[{layer_target}].output"
+
+
+def attach_reft_to_lora_model(
+    lora_model: nn.Module,
     reft_rank: int = 4,
     layer_target: int = 4,
-    lora_alpha: int = 16,
-    pooling: str = "mean",
-    dtype_policy: str = "auto",
-    hf_cache_dir: Optional[str] = None,
-    freeze_lora: bool = True,
+    freeze_previous_phase: bool = True,
 ):
-    from peft import LoraConfig, get_peft_model
+    """
+    HEFT Phase 2. Takes an already Phase-1-trained LoRA model (as returned by
+    get_lora_model / create_lora_sequence_classifier) and attaches a LoReFT
+    intervention on top of it.
+
+    Freezing behaviour:
+      - `freeze_previous_phase=True` explicitly freezes the LoRA adapter
+        parameters first (belt-and-braces).
+      - pyreft.get_reft_model() *also* freezes every remaining parameter of
+        the wrapped model by design -- that's the whole point of ReFT: adapt
+        frozen representations via a small intervention instead of updating
+        weights. So after this call, the classification head and backbone end
+        up frozen too; only the newly added LoReFT intervention parameters
+        are trainable. That matches "train LoRA, freeze it, apply ReFT".
+    """
     import pyreft
 
-    # 1. Base Classifier
-    base = CodeSequenceClassifier(
-        model_name=model_name,
-        freeze_backbone=False,
-        pooling=pooling,
-        dtype_policy=dtype_policy,
-        hf_cache_dir=hf_cache_dir,
-    )
-
-    # 2. Apply LoRA
-    target_modules = infer_lora_target_modules(base)
-    lora_config = LoraConfig(
-        r=rank,
-        lora_alpha=lora_alpha,
-        target_modules=target_modules,
-        bias="none",
-        task_type="FEATURE_EXTRACTION",
-        modules_to_save=["classification_head"],
-    )
-    lora_model = get_peft_model(base, lora_config)
-
-    if freeze_lora:
+    if freeze_previous_phase:
         freeze_lora_parameters(lora_model)
 
-    hidden_size = int(base.backbone.config.hidden_size)
+    hidden_size = int(lora_model.base_model.model.backbone.config.hidden_size)
+    component_path = reft_component_path(layer_target)
 
-    # 3. Explicit Representation Config targeting the backbone encoder
     reft_config = pyreft.ReftConfig(
         representations=[
             pyreft.RepresentationConfig(
                 layer=layer_target,
-                component=f"backbone.encoder.layer[{layer_target}].output",
+                component=component_path,
                 low_rank_dimension=reft_rank,
                 intervention=pyreft.LoreftIntervention(
                     embed_dim=hidden_size,
@@ -270,29 +288,10 @@ def create_heft_sequence_classifier(
         ]
     )
 
-    # Set set_device=False to prevent PyReft from probing custom module properties during init
+    # set_device=False prevents PyReft from probing custom module properties during init
     heft_model = pyreft.get_reft_model(lora_model, reft_config, set_device=False)
-    
+
     # Force PyVene to single-stream / direct intervention mode (bypasses source-to-base requirement)
     heft_model.mode = "single"
-    
-    return heft_model
 
-def get_heft_model(
-    model_name: str = DEFAULT_CODE_MODEL,
-    rank: int = 8,
-    reft_rank: int = 4,
-    layer_target: int = 4,
-    heft_alpha: int = 16,
-    pooling: str = "mean",
-    freeze_lora: bool = True,
-):
-    return create_heft_sequence_classifier(
-        model_name=model_name,
-        rank=rank,
-        reft_rank=reft_rank,
-        layer_target=layer_target,
-        lora_alpha=heft_alpha,
-        pooling=pooling,
-        freeze_lora=freeze_lora,
-    )
+    return heft_model
