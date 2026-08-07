@@ -24,23 +24,25 @@ def forward_lora(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
 
 
 def forward_reft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Phase 2 forward pass: pyreft-wrapped model with a LoReFT intervention."""
-    batch_size, seq_len = input_ids.shape
-    num_interventions = len(model.interventions)
+    """
+    Phase 2 forward pass: pyreft-wrapped model with a LoReFT intervention.
 
-    # In "single" mode, unit_locations is a standard 3D position tensor:
-    # Shape: (num_interventions, batch_size, seq_len)
-    unit_locations = (
-        torch.arange(seq_len, device=input_ids.device)
-        .unsqueeze(0)
-        .repeat(batch_size, 1)
-        .unsqueeze(0)
-        .repeat(num_interventions, 1, 1)
-    )
+    LoReFT is "sourceless" -- it edits the base model's own hidden state directly,
+    it doesn't need a counterfactual source example. pyvene has a dedicated code
+    path for exactly this case: passing unit_locations as {"base": <positions>}
+    (a flat, non-batched list of token positions) tells pyvene's own broadcasting
+    logic (IntervenableModel._broadcast_unit_locations, under the default
+    mode="parallel" that pyreft sets) to expand it across the batch and across
+    every intervention itself. We don't need to hand-build a
+    (num_interventions, batch, seq_len) tensor, and there is no "single" mode in
+    pyvene -- only "parallel" and "serial" are supported.
+    """
+    seq_len = input_ids.shape[1]
+    positions = list(range(seq_len))
 
     outputs = model(
         base={"input_ids": input_ids, "attention_mask": attention_mask},
-        unit_locations=unit_locations,
+        unit_locations={"base": positions},
     )
 
     logits = outputs[1] if isinstance(outputs, (tuple, list)) else outputs

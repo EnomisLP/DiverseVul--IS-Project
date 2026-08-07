@@ -294,7 +294,4 @@ def attach_reft_to_lora_model(
     # set_device=False prevents PyReft from probing custom module properties during init
     heft_model = pyreft.get_reft_model(lora_model, reft_config, set_device=False)
 
-    # Force PyVene to single-stream / direct intervention mode (bypasses source-to-base requirement)
-    heft_model.mode = "single"
-
     return heft_model
