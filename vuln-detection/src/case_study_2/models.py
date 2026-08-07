@@ -274,17 +274,20 @@ def attach_reft_to_lora_model(
     hidden_size = int(lora_model.base_model.model.backbone.config.hidden_size)
     component_path = reft_component_path(layer_target)
 
+    # NOTE: pyreft.ReftConfig expects `representations` as plain dict(s), NOT a
+    # pyreft.RepresentationConfig object -- no such class exists in pyreft's
+    # public API. Every real example in pyreft's own README/docs builds it this way.
     reft_config = pyreft.ReftConfig(
         representations=[
-            pyreft.RepresentationConfig(
-                layer=layer_target,
-                component=component_path,
-                low_rank_dimension=reft_rank,
-                intervention=pyreft.LoreftIntervention(
+            {
+                "layer": layer_target,
+                "component": component_path,
+                "low_rank_dimension": reft_rank,
+                "intervention": pyreft.LoreftIntervention(
                     embed_dim=hidden_size,
                     low_rank_dimension=reft_rank,
                 ),
-            )
+            }
         ]
     )
 
