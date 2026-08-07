@@ -362,7 +362,8 @@ def run_exp5_canonical_retrain(
         max_length=config.max_length, log_prefix="  ",
         reft_rank=config.reft_rank, layer_target=config.layer_target,
     )
-    global_model.save_pretrained(output_dir / "final_canonical_heft_model")
+    global_model.save(save_directory = str(output_dir / "final_canonical_heft_model" / "heft"), include_model=False)
+    global_model.model.save_pretrained(str(output_dir / "final_canonical_heft_model" / "adapter"))
     print(f"[canonical] Done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_heft_model'}")
 
     holdout_predictions = pd.DataFrame({
