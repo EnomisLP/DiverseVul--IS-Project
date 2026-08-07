@@ -1,17 +1,39 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 
 DEFAULT_CODE_MODEL = "huggingface/CodeBERTa-small-v1"
 DEFAULT_CODE_TOKENIZER = "huggingface/CodeBERTa-small-v1"
+
+# EXP-7: NeoBERT-250M backbone (Chandar Research Lab). Plug-and-play replacement
+# for the CodeBERTa backbone above -- same hidden size (768), but a 4,096-token
+# RoPE/YaRE context window, SwiGLU activations, and Pre-RMSNorm. Ships as
+# `trust_remote_code` model code on the Hub rather than a native `transformers`
+# architecture, so it needs a couple of extra loading safeguards (see
+# `_neobert_loading_overrides` below).
+DEFAULT_NEOBERT_MODEL = "chandar-lab/NeoBERT"
+DEFAULT_NEOBERT_TOKENIZER = "chandar-lab/NeoBERT"
+
+# Model-name substrings that identify a NeoBERT-family checkpoint and therefore
+# require `trust_remote_code=True` plus the safeguards below. Kept as a simple
+# substring match (rather than a fixed set) so forks/finetunes of NeoBERT
+# (e.g. "chandar-lab/NeoBERT", "someuser/NeoBERT-finetuned-...") are still
+# picked up automatically.
+_NEOBERT_NAME_HINTS = ("neobert",)
+
+
+def _is_neobert_model(model_name: str) -> bool:
+    name = (model_name or "").lower()
+    return any(hint in name for hint in _NEOBERT_NAME_HINTS)
 
 
 def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
@@ -44,15 +66,50 @@ def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
     raise ValueError(f"Unknown dtype_policy: {dtype_policy}")
 
 
+def _apply_neobert_config_overrides(config: Any) -> Any:
+    """
+    Mandatory Track-B safeguard (PDD sec. 5.2, GitHub Issue #7 on
+    chandar-lab/NeoBERT -- "How is unpadding handled when unpacking?"):
+    sequence-packing / unpadding in the reference NeoBERT code can leak
+    attention across the pad boundary when the collator doesn't also emit
+    packed cu_seqlens, which is exactly our setup (we pad batches instead of
+    packing them). Forcing `use_unpadding=False` makes NeoBERT fall back to
+    strict padded multi-head attention with the HF attention mask, which is
+    the safe/correct path for this pipeline.
+
+    The exact attribute name has moved around across NeoBERT code revisions,
+    so we try the known aliases and only set whichever is actually present on
+    this revision's config, rather than hard-failing.
+    """
+    candidate_flags = ("use_unpadding", "unpad_inputs", "unpad", "pack_sequences")
+    matched = False
+    for flag in candidate_flags:
+        if hasattr(config, flag):
+            setattr(config, flag, False)
+            matched = True
+    if not matched:
+        warnings.warn(
+            "[models] Could not find a known unpadding flag on the NeoBERT config "
+            "(checked: %s). This revision of chandar-lab/NeoBERT may handle "
+            "padding differently -- double check attention-mask correctness "
+            "manually (see PDD sec. 5.2 / GitHub Issue #7)." % (candidate_flags,)
+        )
+    return config
+
+
 def load_code_tokenizer(
     tokenizer_name: str = DEFAULT_CODE_TOKENIZER,
     hf_cache_dir: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
 ):
     configure_huggingface_cache(hf_cache_dir)
+    if trust_remote_code is None:
+        trust_remote_code = _is_neobert_model(tokenizer_name)
     return AutoTokenizer.from_pretrained(
         tokenizer_name,
         use_fast=True,
         cache_dir=hf_cache_dir,
+        trust_remote_code=trust_remote_code,
     )
 
 
@@ -62,14 +119,30 @@ def load_code_encoder(
     device: Optional[str] = None,
     freeze: bool = True,
     hf_cache_dir: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
 ) -> nn.Module:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     configure_huggingface_cache(hf_cache_dir)
     dtype = _dtype_from_policy(dtype_policy, device)
 
-    kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir}
+    is_neobert = _is_neobert_model(model_name)
+    if trust_remote_code is None:
+        trust_remote_code = is_neobert
+
+    kwargs: Dict[str, Any] = {"cache_dir": hf_cache_dir, "trust_remote_code": trust_remote_code}
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
+
+    if is_neobert:
+        # Load + patch the config explicitly (rather than relying on
+        # AutoModel.from_pretrained's implicit config loading) so the
+        # unpadding override in _apply_neobert_config_overrides is guaranteed
+        # to be in effect before the backbone is instantiated.
+        config = AutoConfig.from_pretrained(
+            model_name, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code
+        )
+        config = _apply_neobert_config_overrides(config)
+        kwargs["config"] = config
 
     model = AutoModel.from_pretrained(model_name, **kwargs)
     model.to(device)
@@ -102,6 +175,8 @@ class CodeSequenceClassifier(nn.Module):
         pooling: str = "mean",
         dtype_policy: str = "auto",
         hf_cache_dir: Optional[str] = None,
+        trust_remote_code: Optional[bool] = None,
+        enforce_fp32_head: Optional[bool] = None,
     ) -> None:
         super().__init__()
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -111,10 +186,23 @@ class CodeSequenceClassifier(nn.Module):
             device=device,
             freeze=freeze_backbone,
             hf_cache_dir=hf_cache_dir,
+            trust_remote_code=trust_remote_code,
         )
         hidden_size = int(self.backbone.config.hidden_size)
         self.classification_head = nn.Linear(hidden_size, num_labels)
         self.pooling = pooling
+
+        # Mandatory Track-B safeguard (PDD sec. 5.2, GitHub Issue #11 on
+        # chandar-lab/NeoBERT -- NaN training bug): pooling + the
+        # classification head are forced to run in explicit float32,
+        # regardless of the ambient autocast dtype, so a bf16/fp16 NaN/Inf
+        # produced upstream in NeoBERT's attention stack doesn't get baked
+        # into the (trainable) head via a half-precision matmul. This is a
+        # wrapper-level mitigation -- it doesn't patch NeoBERT's own remote
+        # code, it just keeps *our* downstream math numerically safe.
+        if enforce_fp32_head is None:
+            enforce_fp32_head = _is_neobert_model(model_name)
+        self.enforce_fp32_head = enforce_fp32_head
 
     @property
     def config(self):
@@ -129,12 +217,27 @@ class CodeSequenceClassifier(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden = outputs.last_hidden_state
+
+        if self.enforce_fp32_head:
+            hidden = hidden.float()
+            attention_mask_for_pool = attention_mask.float()
+        else:
+            attention_mask_for_pool = attention_mask
+
         if self.pooling == "cls":
             pooled = cls_pool_last_hidden(hidden)
         else:
-            pooled = mean_pool_last_hidden(hidden, attention_mask)
-        logits = self.classification_head(pooled)
-        
+            pooled = mean_pool_last_hidden(hidden, attention_mask_for_pool)
+
+        if self.enforce_fp32_head:
+            # Disable autocast for the head matmul so it isn't silently
+            # downcast back to bf16/fp16 by the enclosing `torch.amp.autocast`
+            # context in the training loop.
+            with torch.autocast(device_type=pooled.device.type, enabled=False):
+                logits = self.classification_head(pooled.float())
+        else:
+            logits = self.classification_head(pooled)
+
         if logits.ndim > 1 and logits.size(-1) == 1:
             return logits.squeeze(-1)
         return logits
@@ -172,6 +275,7 @@ def create_lora_sequence_classifier(
     pooling: str = "mean",
     dtype_policy: str = "auto",
     hf_cache_dir: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
 ):
     from peft import LoraConfig, get_peft_model
 
@@ -181,6 +285,7 @@ def create_lora_sequence_classifier(
         pooling=pooling,
         dtype_policy=dtype_policy,
         hf_cache_dir=hf_cache_dir,
+        trust_remote_code=trust_remote_code,
     )
     target_modules = infer_lora_target_modules(base)
     config = LoraConfig(
@@ -195,12 +300,19 @@ def create_lora_sequence_classifier(
     return get_peft_model(base, config)
 
 
-def get_lora_model(model_name: str = DEFAULT_CODE_MODEL, rank: int = 8, lora_alpha: int = 16, pooling: str = "mean"):
+def get_lora_model(
+    model_name: str = DEFAULT_CODE_MODEL,
+    rank: int = 8,
+    lora_alpha: int = 16,
+    pooling: str = "mean",
+    trust_remote_code: Optional[bool] = None,
+):
     return create_lora_sequence_classifier(
         model_name=model_name,
         rank=rank,
         lora_alpha=lora_alpha,
         pooling=pooling,
+        trust_remote_code=trust_remote_code,
     )
 
 
