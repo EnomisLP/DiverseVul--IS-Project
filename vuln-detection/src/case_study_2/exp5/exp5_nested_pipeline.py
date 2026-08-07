@@ -15,7 +15,7 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, con
 import matplotlib.pyplot as plt
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
-from case_study_2.models import configure_huggingface_cache, load_code_tokenizer, DEFAULT_CODE_TOKENIZER
+from case_study_2.models import configure_huggingface_cache, load_code_tokenizer, DEFAULT_CODE_TOKENIZER, save_heft_model
 from case_study_2.exp5.exp5_heft import train_heft_model_safe
 from case_study_1 import split_manifest
 from case_study_1 import evaluation
@@ -274,7 +274,8 @@ def run_exp5_nested_rank(
         }
 
         if outer_fold_id == fold_ids[-1]:
-            final_outer_model.save_pretrained(output_dir / "final_exp5_heft_adapter")
+            final_outer_model.save(save_directory=str(output_dir / "final_exp5_heft_adapter" / "reft"), include_model=False)
+            final_outer_model.model.save_pretrained(str(output_dir / "final_exp5_heft_adapter" / "lora_adapter"))
             print(f"[nested] saved final fold HEFT adapter to {output_dir / 'final_exp5_heft_adapter'}")
 
         _write_outer_checkpoint(output_dir, outer_fold_id, fold_oof, selected_row, training_row)
