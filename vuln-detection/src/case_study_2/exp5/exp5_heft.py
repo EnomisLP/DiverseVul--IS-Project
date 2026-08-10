@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import time
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -13,6 +12,7 @@ from case_study_2.models import (
     count_trainable_parameters,
     DEFAULT_CODE_MODEL,
 )
+from case_study_2.training_utils import EarlyStoppingConfig, run_training_with_early_stopping
 
 
 def forward_lora(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -51,59 +51,13 @@ def forward_reft(model: nn.Module, input_ids: torch.Tensor, attention_mask: torc
     return logits
 
 
-def _run_training_epochs(
-    model, forward_fn, loader, optimizer, criterion, epochs, device, is_cuda,
-    grad_accum_steps, verbose, log_every_steps, log_prefix, phase_name, t0,
-    total_steps_per_epoch,
-):
-    """Shared epoch loop used by both the Phase 1 (LoRA) and Phase 2 (ReFT) training stages."""
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0.0
-        n_steps = 0
-        epoch_t0 = time.time()
-        optimizer.zero_grad()
-
-        for step, batch in enumerate(loader):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
-
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = forward_fn(model, input_ids, attention_mask)
-                loss = criterion(logits, labels.float()) / grad_accum_steps
-
-            loss.backward()
-            epoch_loss += loss.item() * grad_accum_steps
-            n_steps += 1
-
-            if (step + 1) % grad_accum_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-            if verbose and log_every_steps and (step + 1) % log_every_steps == 0:
-                elapsed_min = (time.time() - epoch_t0) / 60
-                steps_left = total_steps_per_epoch - (step + 1)
-                rate = (step + 1) / max(elapsed_min, 1e-6)
-                eta_min = steps_left / max(rate, 1e-6)
-                print(
-                    f"{log_prefix}[{phase_name}] epoch {epoch+1}/{epochs} step {step+1}/{total_steps_per_epoch} | "
-                    f"avg_loss_so_far={epoch_loss/max(n_steps,1):.4f} | "
-                    f"elapsed={elapsed_min:.1f} min | ETA epoch ~{eta_min:.1f} min"
-                )
-
-        if n_steps > 0 and n_steps % grad_accum_steps != 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-        if verbose:
-            elapsed_min = (time.time() - t0) / 60
-            epoch_min = (time.time() - epoch_t0) / 60
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9 if is_cuda else 0.0
-            print(
-                f"{log_prefix}[{phase_name}] epoch {epoch+1}/{epochs} done | avg_loss={epoch_loss/max(n_steps,1):.4f} "
-                f"| epoch_time={epoch_min:.1f} min | total_elapsed={elapsed_min:.1f} min | peak_VRAM={peak_vram:.2f} GB"
-            )
+def _run_training_epochs(*_args, **_kwargs):
+    raise NotImplementedError(
+        "_run_training_epochs was replaced by "
+        "case_study_2.training_utils.run_training_with_early_stopping (see FIX notes "
+        "in that module and in train_heft_model below). This stub is kept only so a "
+        "stale import doesn't fail silently with an AttributeError instead of a clear message."
+    )
 
 
 def train_heft_model(
@@ -129,6 +83,21 @@ def train_heft_model(
     heft_alpha=16,
     lora_lr=2e-4,
     reft_lr=2e-4,
+    # --- FIX (see case_study_2/training_utils.py header for full context) --
+    # `lora_epochs`/`reft_epochs` are now CEILINGS: each phase early-stops on
+    # its own validation PR-AUC (computed with THAT phase's forward pass --
+    # plain LoRA for phase 1, the pyreft-wrapped model for phase 2) and
+    # restores its own best checkpoint before the next phase starts, instead
+    # of always running a fixed epoch count and handing whatever the last
+    # epoch produced to the next phase. Separate patience/min_epochs for LoRA
+    # vs ReFT because empirically ReFT converges much faster (val loss was
+    # already flat by epoch 2 in the original run) than LoRA.
+    early_stopping=True,
+    min_delta=1e-4,
+    lora_patience=2,
+    lora_min_epochs=2,
+    reft_patience=2,
+    reft_min_epochs=1,
 ):
     """
     HEFT training: Phase 1 trains LoRA to convergence, Phase 2 freezes
@@ -151,8 +120,6 @@ def train_heft_model(
     total_steps_per_epoch = -(-len(train_df) // batch_size)
     pos_weight = get_class_weights(train_df).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    t0 = time.time()
 
     # -----------------------------------------------------------------
     # Phase 1: LoRA
@@ -177,11 +144,15 @@ def train_heft_model(
     lora_trainable_params = [p for p in lora_model.parameters() if p.requires_grad]
     lora_optimizer = AdamW(lora_trainable_params, lr=lora_lr)
 
-    _run_training_epochs(
-        lora_model, forward_lora, train_loader, lora_optimizer, criterion,
-        epochs=lora_epochs, device=device, is_cuda=is_cuda, grad_accum_steps=grad_accum_steps,
+    lora_es_config = EarlyStoppingConfig(
+        max_epochs=lora_epochs, patience=lora_patience, min_delta=min_delta,
+        min_epochs=lora_min_epochs, enabled=early_stopping,
+    )
+    _, lora_best_epoch, lora_history = run_training_with_early_stopping(
+        lora_model, forward_lora, train_loader, val_loader, lora_optimizer, criterion, device,
+        es_config=lora_es_config, is_cuda=is_cuda, grad_accum_steps=grad_accum_steps,
         verbose=verbose, log_every_steps=log_every_steps, log_prefix=log_prefix,
-        phase_name="lora", t0=t0, total_steps_per_epoch=total_steps_per_epoch,
+        phase_name="lora", total_steps_per_epoch=total_steps_per_epoch,
     )
 
     del lora_optimizer
@@ -209,26 +180,22 @@ def train_heft_model(
     reft_trainable_params = [p for p in heft_model.parameters() if p.requires_grad]
     reft_optimizer = AdamW(reft_trainable_params, lr=reft_lr)
 
-    _run_training_epochs(
-        heft_model, forward_reft, train_loader, reft_optimizer, criterion,
-        epochs=reft_epochs, device=device, is_cuda=is_cuda, grad_accum_steps=grad_accum_steps,
+    reft_es_config = EarlyStoppingConfig(
+        max_epochs=reft_epochs, patience=reft_patience, min_delta=min_delta,
+        min_epochs=reft_min_epochs, enabled=early_stopping,
+    )
+    all_scores, reft_best_epoch, reft_history = run_training_with_early_stopping(
+        heft_model, forward_reft, train_loader, val_loader, reft_optimizer, criterion, device,
+        es_config=reft_es_config, is_cuda=is_cuda, grad_accum_steps=grad_accum_steps,
         verbose=verbose, log_every_steps=log_every_steps, log_prefix=log_prefix,
-        phase_name="reft", t0=t0, total_steps_per_epoch=total_steps_per_epoch,
+        phase_name="reft", total_steps_per_epoch=total_steps_per_epoch,
     )
 
     if verbose:
-        print(f"{log_prefix}[heft] training done, scoring validation set ({len(val_df)} rows)...")
-
-    heft_model.eval()
-    all_scores = []
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = forward_reft(heft_model, input_ids, attention_mask)
-                scores = torch.sigmoid(logits)
-            all_scores.extend(scores.float().cpu().numpy())
+        print(
+            f"{log_prefix}[heft] training done | lora best_epoch={lora_best_epoch}/{lora_epochs} "
+            f"| reft best_epoch={reft_best_epoch}/{reft_epochs}"
+        )
 
     del train_loader, val_loader, criterion, reft_optimizer
     if is_cuda:
@@ -236,6 +203,31 @@ def train_heft_model(
         torch.cuda.reset_peak_memory_stats()
 
     return np.array(all_scores), heft_model
+
+
+def score_model(model, df, tokenizer, device, code_column="normalized_code",
+                 max_length=512, batch_size=32, num_workers=2):
+    """
+    Public scoring helper for the final (Phase-2, pyreft-wrapped) HEFT model,
+    no-gradient, deliberately separate from the early-stopping validation
+    loop used during training (see leakage-guard rationale in
+    run_exp5_canonical_retrain).
+    """
+    loader = create_dataloader(
+        df, tokenizer, batch_size=batch_size, max_length=max_length,
+        shuffle=False, num_workers=num_workers, code_column=code_column,
+    )
+    model.eval()
+    all_scores = []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = forward_reft(model, input_ids, attention_mask)
+                scores = torch.sigmoid(logits)
+            all_scores.extend(scores.float().cpu().numpy())
+    return np.array(all_scores)
 
 
 def train_heft_model_safe(*args, max_retries=2, **kwargs):

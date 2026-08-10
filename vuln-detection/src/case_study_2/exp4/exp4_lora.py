@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import time
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -9,6 +8,14 @@ import numpy as np
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import get_lora_model, count_trainable_parameters, DEFAULT_CODE_MODEL
+from case_study_2.training_utils import EarlyStoppingConfig, run_training_with_early_stopping
+
+
+def forward_lora(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    logits = model(input_ids=input_ids, attention_mask=attention_mask)
+    if logits.ndim > 1 and logits.size(-1) == 1:
+        logits = logits.squeeze(-1)
+    return logits
 
 
 def train_lora_model(
@@ -28,6 +35,18 @@ def train_lora_model(
     verbose=True,
     log_every_steps=50,
     log_prefix="",
+    # --- FIX (see case_study_2/training_utils.py header for full context) --
+    # `epochs` is now a CEILING (max_epochs), not a fixed count: training
+    # stops early once validation PR-AUC stops improving, and the BEST
+    # checkpoint (not necessarily the last) is what gets returned. This
+    # matches the early-stopping convention already used by Track A's MLP
+    # (case_study_1/exp2/exp2_mlp.py) and is consistent with the fact that
+    # EXP-3's linear probe (sklearn lbfgs) already trains to real
+    # convergence rather than a fixed iteration count.
+    early_stopping=True,
+    patience=2,
+    min_delta=1e-4,
+    min_epochs=2,
 ):
     train_loader = create_dataloader(
         train_df, tokenizer, batch_size=batch_size, max_length=max_length,
@@ -41,7 +60,6 @@ def train_lora_model(
     model = get_lora_model(model_name=DEFAULT_CODE_MODEL, rank=rank, lora_alpha=16).to(device)
 
     is_cuda = (device == "cuda") or (hasattr(device, "type") and device.type == "cuda")
-
     total_steps_per_epoch = -(-len(train_df) // batch_size)
 
     if verbose:
@@ -59,68 +77,16 @@ def train_lora_model(
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = AdamW(model.parameters(), lr=2e-4)
 
-    t0 = time.time()
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0.0
-        n_steps = 0
-        epoch_t0 = time.time()
-        optimizer.zero_grad()
-
-        for step, batch in enumerate(train_loader):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
-
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids, attention_mask)
-                loss = criterion(logits, labels) / grad_accum_steps
-
-            loss.backward()
-            epoch_loss += loss.item() * grad_accum_steps
-            n_steps += 1
-
-            if (step + 1) % grad_accum_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-            if verbose and log_every_steps and (step + 1) % log_every_steps == 0:
-                elapsed_min = (time.time() - epoch_t0) / 60
-                steps_left = total_steps_per_epoch - (step + 1)
-                rate = (step + 1) / max(elapsed_min, 1e-6)
-                eta_min = steps_left / max(rate, 1e-6)
-                print(
-                    f"{log_prefix}[lora] epoch {epoch+1}/{epochs} step {step+1}/{total_steps_per_epoch} | "
-                    f"avg_loss_so_far={epoch_loss/max(n_steps,1):.4f} | "
-                    f"elapsed={elapsed_min:.1f} min | ETA epoch ~{eta_min:.1f} min"
-                )
-
-        optimizer.step()
-        optimizer.zero_grad()
-
-        if verbose:
-            elapsed_min = (time.time() - t0) / 60
-            epoch_min = (time.time() - epoch_t0) / 60
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9 if is_cuda else 0.0
-            print(
-                f"{log_prefix}[lora] epoch {epoch+1}/{epochs} done | avg_loss={epoch_loss/max(n_steps,1):.4f} "
-                f"| epoch_time={epoch_min:.1f} min | total_elapsed={elapsed_min:.1f} min | peak_VRAM={peak_vram:.2f} GB"
-            )
-
-    if verbose:
-        print(f"{log_prefix}[lora] training done, scoring validation set ({len(val_df)} rows)...")
-
-    model.eval()
-    all_scores = []
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids, attention_mask)
-                scores = torch.sigmoid(logits)
-            all_scores.extend(scores.float().cpu().numpy())
+    es_config = EarlyStoppingConfig(
+        max_epochs=epochs, patience=patience, min_delta=min_delta,
+        min_epochs=min_epochs, enabled=early_stopping,
+    )
+    all_scores, best_epoch, history = run_training_with_early_stopping(
+        model, forward_lora, train_loader, val_loader, optimizer, criterion, device,
+        es_config=es_config, is_cuda=is_cuda, grad_accum_steps=grad_accum_steps,
+        verbose=verbose, log_every_steps=log_every_steps, log_prefix=log_prefix,
+        phase_name="lora", total_steps_per_epoch=total_steps_per_epoch,
+    )
 
     del train_loader, val_loader, criterion, optimizer
     if is_cuda:
@@ -128,6 +94,31 @@ def train_lora_model(
         torch.cuda.reset_peak_memory_stats()
 
     return np.array(all_scores), model
+
+
+def score_model(model, df, tokenizer, device, code_column="normalized_code",
+                 max_length=512, batch_size=32, num_workers=2):
+    """
+    Public scoring helper: no-gradient pass over an arbitrary dataframe,
+    deliberately separate from the early-stopping validation loop. Used by
+    run_exp4_canonical_retrain for the single, final pass over the frozen
+    outer holdout (see leakage-guard rationale in exp4_nested_pipeline.py).
+    """
+    loader = create_dataloader(
+        df, tokenizer, batch_size=batch_size, max_length=max_length,
+        shuffle=False, num_workers=num_workers, code_column=code_column,
+    )
+    model.eval()
+    all_scores = []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = forward_lora(model, input_ids, attention_mask)
+                scores = torch.sigmoid(logits)
+            all_scores.extend(scores.float().cpu().numpy())
+    return np.array(all_scores)
 
 
 def train_lora_model_safe(*args, max_retries=2, **kwargs):

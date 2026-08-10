@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import configure_huggingface_cache, load_code_tokenizer, DEFAULT_CODE_TOKENIZER
-from case_study_2.exp5.exp5_heft import train_heft_model_safe
+from case_study_2.exp5.exp5_heft import train_heft_model_safe, score_model
 from case_study_1 import split_manifest
 from case_study_1 import evaluation
 from case_study_1.evaluation import EvaluationConfig
@@ -40,18 +40,40 @@ class Exp5Config:
     max_length: int = 512
     train_batch_size: int = 16
     grad_accum_steps: int = 2
-    lora_epochs: int = 2
-    reft_epochs: int = 2
+
+    # --- FIX (undertraining diagnosis, see handoff notes) -------------------
+    # Original run: lora_epochs=2, reft_epochs=2, both FIXED. LoRA sub-phase
+    # loss was still falling sharply at epoch 2 (1.1382 -> 1.0685, -6.1%) --
+    # i.e. even less trained than EXP-4's own (also undertrained) standalone
+    # LoRA canonical retrain (4 epochs). ReFT sub-phase, by contrast, was
+    # already flat by epoch 2 (1.0449 -> 1.0435) -- it converges fast, so it
+    # gets a shorter ceiling/patience below. Both are now CEILINGS with
+    # independent early stopping (see train_heft_model in exp5_heft.py).
+    lora_epochs: int = 10     # was: 2
+    reft_epochs: int = 6      # was: 2
+    early_stopping: bool = True
+    min_delta: float = 1e-4
+    lora_patience: int = 2
+    lora_min_epochs: int = 2
+    reft_patience: int = 2
+    reft_min_epochs: int = 1  # ReFT converges fast; don't force extra epochs
+
+    # Rank-search phase gets its own (smaller) ceiling to keep the grid
+    # search affordable, but still early-stops rather than using a blind
+    # fixed count -- patience=1/min_epochs=1 so a clearly-converged
+    # candidate doesn't burn the full ceiling just to rank it.
+    search_max_epochs: int = 4
+    search_patience: int = 1
+    search_min_epochs: int = 1
 
     rank_grid: Tuple[int, ...] = (8, 16)
     reft_rank: int = 4
     layer_target: int = 4
-    
+
     inner_n_splits: int = 3
     inner_random_state: int = 20260707
     decision_threshold: float = 0.50
 
-    search_epochs: int = 1
     search_n_splits: int = 4
 
     num_workers: int = 6
@@ -217,13 +239,16 @@ def run_exp5_nested_rank(
 
             val_scores, tmp_model = train_heft_model_safe(
                 search_train_df, search_val_df, tokenizer, rank=rank_candidate,
-                lora_epochs=config.search_epochs, reft_epochs=config.search_epochs,
+                lora_epochs=config.search_max_epochs, reft_epochs=config.search_max_epochs,
                 batch_size=config.train_batch_size,
                 grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
                 num_workers=config.num_workers, device=device,
                 hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
                 max_length=config.max_length, log_prefix="    ",
                 reft_rank=config.reft_rank, layer_target=config.layer_target,
+                early_stopping=config.early_stopping, min_delta=config.min_delta,
+                lora_patience=config.search_patience, lora_min_epochs=config.search_min_epochs,
+                reft_patience=config.search_patience, reft_min_epochs=config.search_min_epochs,
             )
             prauc = float(average_precision_score(search_val_df[config.label_column].values, val_scores))
             rank_performance[rank_candidate] = prauc
@@ -253,6 +278,9 @@ def run_exp5_nested_rank(
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
             max_length=config.max_length, log_prefix="    ",
             reft_rank=config.reft_rank, layer_target=config.layer_target,
+            early_stopping=config.early_stopping, min_delta=config.min_delta,
+            lora_patience=config.lora_patience, lora_min_epochs=config.lora_min_epochs,
+            reft_patience=config.reft_patience, reft_min_epochs=config.reft_min_epochs,
         )
         print(f"[nested] refit done in {(time.time()-refit_t0)/60:.1f} min")
 
@@ -346,14 +374,39 @@ def run_exp5_canonical_retrain(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- FIX (leakage guard) -------------------------------------------
+    # Same issue as EXP-4/EXP-7: train_heft_model now early-stops (both
+    # phases) against whatever val_df it is given. Passing holdout_frame
+    # straight in would let early stopping pick checkpoints using the frozen
+    # outer holdout. Fix: carve a small internal validation split out of
+    # development_frame for early stopping, score holdout_frame separately
+    # afterwards with the selected checkpoint.
+    canonical_val_config = split_manifest.SplitConfig(
+        n_splits=config.search_n_splits,
+        random_state=config.inner_random_state,
+        shuffle=True,
+        source_id_column=config.source_id_column,
+        label_column=config.label_column,
+        group_column=config.project_column,
+    )
+    canonical_manifest = split_manifest.create_project_grouped_manifest(
+        development_frame[[config.source_id_column, config.label_column, config.project_column]],
+        config=canonical_val_config,
+    )
+    canonical_train_ids = canonical_manifest.loc[canonical_manifest["fold"] != 0, config.source_id_column]
+    canonical_val_ids = canonical_manifest.loc[canonical_manifest["fold"] == 0, config.source_id_column]
+    canonical_train_df = development_frame[development_frame[config.source_id_column].isin(canonical_train_ids)].reset_index(drop=True)
+    canonical_val_df = development_frame[development_frame[config.source_id_column].isin(canonical_val_ids)].reset_index(drop=True)
     print(
-        f"[canonical] Retraining on full development set ({len(development_frame)} rows), "
-        f"rank={selected_rank}, {config.lora_epochs} LoRA + {config.reft_epochs} ReFT epochs"
+        f"[canonical] Retraining with internal early-stopping split: "
+        f"train={len(canonical_train_df)} rows | internal_val={len(canonical_val_df)} rows "
+        f"(holdout, {len(holdout_frame)} rows, is NOT used for early stopping) | "
+        f"rank={selected_rank}, up to {config.lora_epochs} LoRA + {config.reft_epochs} ReFT epochs"
     )
     t0 = time.time()
 
-    holdout_scores, global_model = train_heft_model_safe(
-        development_frame, holdout_frame, tokenizer, rank=selected_rank,
+    _, global_model = train_heft_model_safe(
+        canonical_train_df, canonical_val_df, tokenizer, rank=selected_rank,
         lora_epochs=config.lora_epochs, reft_epochs=config.reft_epochs,
         batch_size=config.train_batch_size,
         grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
@@ -361,10 +414,20 @@ def run_exp5_canonical_retrain(
         hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
         max_length=config.max_length, log_prefix="  ",
         reft_rank=config.reft_rank, layer_target=config.layer_target,
+        early_stopping=config.early_stopping, min_delta=config.min_delta,
+        lora_patience=config.lora_patience, lora_min_epochs=config.lora_min_epochs,
+        reft_patience=config.reft_patience, reft_min_epochs=config.reft_min_epochs,
     )
     global_model.save(save_directory = str(output_dir / "final_canonical_heft_model" / "heft"), include_model=False)
     global_model.model.save_pretrained(str(output_dir / "final_canonical_heft_model" / "adapter"))
-    print(f"[canonical] Done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_heft_model'}")
+    print(f"[canonical] Training done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_heft_model'}")
+
+    print(f"[canonical] Scoring frozen outer holdout ({len(holdout_frame)} rows)...")
+    holdout_scores = score_model(
+        global_model, holdout_frame, tokenizer, device,
+        code_column=config.code_column, max_length=config.max_length,
+        batch_size=config.eval_batch_size, num_workers=config.num_workers,
+    )
 
     holdout_predictions = pd.DataFrame({
         config.source_id_column: holdout_frame[config.source_id_column].values,

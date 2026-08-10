@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import configure_huggingface_cache, load_code_tokenizer, DEFAULT_CODE_TOKENIZER
-from case_study_2.exp4.exp4_lora import train_lora_model_safe
+from case_study_2.exp4.exp4_lora import train_lora_model_safe, score_model
 from case_study_1 import split_manifest
 from case_study_1 import evaluation
 from case_study_1.evaluation import EvaluationConfig
@@ -41,14 +41,26 @@ class Exp4Config:
     max_length: int = 512
     train_batch_size: int = 16
     grad_accum_steps: int = 2
-    epochs: int = 3
+
+    # --- FIX (undertraining diagnosis, see handoff notes) -------------------
+    # Canonical retrain's training loss was still falling steadily at epoch
+    # 4/4 (1.1369 -> 1.0712 -> 1.0228 -> 0.9808), decelerating but not flat.
+    # `epochs` / `search_epochs` are now CEILINGS: exp4_lora.train_lora_model
+    # early-stops on validation PR-AUC and returns the best checkpoint, so
+    # raising these ceilings is free when the model already converged, and
+    # gives it room to actually finish when it hadn't.
+    epochs: int = 10          # was: 3
+    search_epochs: int = 4    # was: 1
+    early_stopping: bool = True
+    patience: int = 2
+    min_delta: float = 1e-4
+    min_epochs: int = 2
 
     rank_grid: Tuple[int, ...] = (8, 16)
     inner_n_splits: int = 3
     inner_random_state: int = 20260707
     decision_threshold: float = 0.50
 
-    search_epochs: int = 1
     search_n_splits: int = 4
 
     num_workers: int = 6
@@ -216,6 +228,8 @@ def run_exp4_nested_rank(
                 num_workers=config.num_workers, device=device,
                 hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
                 max_length=config.max_length, log_prefix="    ",
+                early_stopping=config.early_stopping, patience=config.patience,
+                min_delta=config.min_delta, min_epochs=config.min_epochs,
             )
             prauc = float(average_precision_score(search_val_df[config.label_column].values, val_scores))
             rank_performance[rank_candidate] = prauc
@@ -240,6 +254,8 @@ def run_exp4_nested_rank(
             num_workers=config.num_workers, device=device,
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
             max_length=config.max_length, log_prefix="    ",
+            early_stopping=config.early_stopping, patience=config.patience,
+            min_delta=config.min_delta, min_epochs=config.min_epochs,
         )
         print(f"[nested] refit done in {(time.time()-refit_t0)/60:.1f} min")
 
@@ -332,19 +348,59 @@ def run_exp4_canonical_retrain(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[canonical] Retraining on full development set ({len(development_frame)} rows), rank={selected_rank}, {config.epochs} epochs")
+    # --- FIX (leakage guard) -------------------------------------------
+    # train_lora_model now early-stops against whatever val_df it is given.
+    # The OLD code passed holdout_frame straight in as that val_df -- fine
+    # when val_df was only used for post-hoc scoring at a fixed epoch count,
+    # but a genuine leak now: early stopping would be selecting the "best"
+    # epoch using the frozen outer holdout, which must be touched exactly
+    # once, at final evaluation time. Fix: carve a small internal validation
+    # split out of development_frame (project-grouped, like the rank-search
+    # split above) purely for early stopping, then score holdout_frame in
+    # one separate no-gradient pass with the selected checkpoint.
+    canonical_val_config = split_manifest.SplitConfig(
+        n_splits=config.search_n_splits,
+        random_state=config.inner_random_state,
+        shuffle=True,
+        source_id_column=config.source_id_column,
+        label_column=config.label_column,
+        group_column=config.project_column,
+    )
+    canonical_manifest = split_manifest.create_project_grouped_manifest(
+        development_frame[[config.source_id_column, config.label_column, config.project_column]],
+        config=canonical_val_config,
+    )
+    canonical_train_ids = canonical_manifest.loc[canonical_manifest["fold"] != 0, config.source_id_column]
+    canonical_val_ids = canonical_manifest.loc[canonical_manifest["fold"] == 0, config.source_id_column]
+    canonical_train_df = development_frame[development_frame[config.source_id_column].isin(canonical_train_ids)].reset_index(drop=True)
+    canonical_val_df = development_frame[development_frame[config.source_id_column].isin(canonical_val_ids)].reset_index(drop=True)
+    print(
+        f"[canonical] Retraining with internal early-stopping split: "
+        f"train={len(canonical_train_df)} rows | internal_val={len(canonical_val_df)} rows "
+        f"(holdout, {len(holdout_frame)} rows, is NOT used for early stopping) | "
+        f"rank={selected_rank}, up to {config.epochs} epochs"
+    )
     t0 = time.time()
 
-    holdout_scores, global_model = train_lora_model_safe(
-        development_frame, holdout_frame, tokenizer, rank=selected_rank,
+    _, global_model = train_lora_model_safe(
+        canonical_train_df, canonical_val_df, tokenizer, rank=selected_rank,
         epochs=config.epochs, batch_size=config.train_batch_size,
         grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
         num_workers=config.num_workers, device=device,
         hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
         max_length=config.max_length, log_prefix="  ",
+        early_stopping=config.early_stopping, patience=config.patience,
+        min_delta=config.min_delta, min_epochs=config.min_epochs,
     )
     global_model.save_pretrained(output_dir / "final_canonical_lora_model")
-    print(f"[canonical] Done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_lora_model'}")
+    print(f"[canonical] Training done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_lora_model'}")
+
+    print(f"[canonical] Scoring frozen outer holdout ({len(holdout_frame)} rows)...")
+    holdout_scores = score_model(
+        global_model, holdout_frame, tokenizer, device,
+        code_column=config.code_column, max_length=config.max_length,
+        batch_size=config.eval_batch_size, num_workers=config.num_workers,
+    )
 
     holdout_predictions = pd.DataFrame({
         config.source_id_column: holdout_frame[config.source_id_column].values,

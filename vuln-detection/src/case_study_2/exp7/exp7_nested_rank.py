@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
 from case_study_2.models import configure_huggingface_cache, load_code_tokenizer, DEFAULT_NEOBERT_TOKENIZER
-from case_study_2.exp7.exp7_lora import train_lora_model_safe, score_model
+from case_study_2.exp7.exp7_lora import train_lora_model_safe
 from case_study_1 import split_manifest
 from case_study_1 import evaluation
 from case_study_1.evaluation import EvaluationConfig
@@ -59,6 +59,7 @@ class Exp7Config:
     search_epochs: int = 4    # was: 1 (per-rank-candidate search ceiling)
     early_stopping: bool = True
     patience: int = 2         # stop if val PR-AUC hasn't improved in 2 epochs
+    min_delta: float = 1e-4
     min_epochs: int = 2       # never stop before this many epochs, even if
                                # epoch 1 "improved" trivially over the -1.0 floor
 
@@ -235,7 +236,7 @@ def run_exp7_nested_rank(
                 hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
                 max_length=config.max_length, log_prefix="    ",
                 early_stopping=config.early_stopping, patience=config.patience,
-                min_epochs=config.min_epochs,
+                min_delta=config.min_delta, min_epochs=config.min_epochs,
             )
             prauc = float(average_precision_score(search_val_df[config.label_column].values, val_scores))
             rank_performance[rank_candidate] = prauc
@@ -261,7 +262,7 @@ def run_exp7_nested_rank(
             hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
             max_length=config.max_length, log_prefix="    ",
             early_stopping=config.early_stopping, patience=config.patience,
-            min_epochs=config.min_epochs,
+            min_delta=config.min_delta, min_epochs=config.min_epochs,
         )
         print(f"[nested] refit done in {(time.time()-refit_t0)/60:.1f} min")
 
@@ -383,45 +384,26 @@ def run_exp7_canonical_retrain(
     canonical_val_ids = canonical_manifest.loc[canonical_manifest["fold"] == 0, config.source_id_column]
     canonical_train_df = development_frame[development_frame[config.source_id_column].isin(canonical_train_ids)].reset_index(drop=True)
     canonical_val_df = development_frame[development_frame[config.source_id_column].isin(canonical_val_ids)].reset_index(drop=True)
+    print(
+        f"[canonical] Retraining with internal early-stopping split: "
+        f"train={len(canonical_train_df)} rows | internal_val={len(canonical_val_df)} rows "
+        f"(holdout, {len(holdout_frame)} rows, is NOT used for early stopping) | "
+        f"rank={selected_rank}, up to {config.epochs} epochs"
+    )
+    t0 = time.time()
 
-    # --- CHECKPOINT (canonical retrain) --------------------------------
-    # Canonical retrain has no per-epoch checkpointing, so a crash AFTER
-    # save_pretrained() but before/during holdout scoring (e.g. the
-    # score_model NameError) used to mean re-running the full ~2hr training
-    # from scratch just to redo a scoring pass. If a saved adapter already
-    # exists at this path, reload it and skip straight to scoring instead.
-    canonical_model_path = output_dir / "final_canonical_lora_model"
-    if canonical_model_path.exists():
-        from peft import PeftModel
-        from case_study_2.models import CodeSequenceClassifier, DEFAULT_NEOBERT_MODEL
-
-        print(f"[canonical] Found existing model at {canonical_model_path}, skipping training and loading it.")
-        base_model = CodeSequenceClassifier(
-            model_name=DEFAULT_NEOBERT_MODEL, freeze_backbone=False,
-            pooling="mean", hf_cache_dir=config.hf_cache_dir,
-        )
-        global_model = PeftModel.from_pretrained(base_model, str(canonical_model_path)).to(device)
-    else:
-        print(
-            f"[canonical] Retraining with internal early-stopping split: "
-            f"train={len(canonical_train_df)} rows | internal_val={len(canonical_val_df)} rows "
-            f"(holdout, {len(holdout_frame)} rows, is NOT used for early stopping) | "
-            f"rank={selected_rank}, up to {config.epochs} epochs"
-        )
-        t0 = time.time()
-
-        _, global_model = train_lora_model_safe(
-            canonical_train_df, canonical_val_df, tokenizer, rank=selected_rank,
-            epochs=config.epochs, batch_size=config.train_batch_size,
-            grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
-            num_workers=config.num_workers, device=device,
-            hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
-            max_length=config.max_length, log_prefix="  ",
-            early_stopping=config.early_stopping, patience=config.patience,
-            min_epochs=config.min_epochs,
-        )
-        global_model.save_pretrained(canonical_model_path)
-        print(f"[canonical] Training done in {(time.time()-t0)/60:.1f} min | model saved to {canonical_model_path}")
+    _, global_model = train_lora_model_safe(
+        canonical_train_df, canonical_val_df, tokenizer, rank=selected_rank,
+        epochs=config.epochs, batch_size=config.train_batch_size,
+        grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
+        num_workers=config.num_workers, device=device,
+        hf_cache_dir=config.hf_cache_dir, code_column=config.code_column,
+        max_length=config.max_length, log_prefix="  ",
+        early_stopping=config.early_stopping, patience=config.patience,
+        min_delta=config.min_delta, min_epochs=config.min_epochs,
+    )
+    global_model.save_pretrained(output_dir / "final_canonical_lora_model")
+    print(f"[canonical] Training done in {(time.time()-t0)/60:.1f} min | model saved to {output_dir / 'final_canonical_lora_model'}")
 
     # Single, no-gradient scoring pass over the frozen outer holdout with the
     # selected (best-val-PR-AUC) checkpoint. This is the ONLY point in the
