@@ -353,8 +353,70 @@ def reft_component_path(layer_target: int) -> str:
     fail to find it. It must be prefixed with "base_model.model." to match the
     wrapped model's actual module tree. (This mirrors the pattern pyreft's own
     docs use for peft-wrapped causal LMs: "base_model.model.model.layers[i]...".)
+
+    NOTE: this hardcoded path assumes a BERT/RoBERTa-style module tree
+    (`encoder.layer[i].output`), which is what CodeBERTa (EXP-5) has. It does
+    NOT apply to NeoBERT (EXP-8) -- see resolve_reft_component_path below,
+    which is architecture-aware and used for both.
     """
     return f"base_model.model.backbone.encoder.layer[{layer_target}].output"
+
+
+def resolve_reft_component_path(lora_model: nn.Module, layer_target: int, model_name: str) -> str:
+    """
+    Architecture-aware version of reft_component_path, used by
+    attach_reft_to_lora_model for both EXP-5 (CodeBERTa) and EXP-8 (NeoBERT).
+
+    CodeBERTa is a standard BERT/RoBERTa-style module tree
+    (`encoder.layer[i].output` per layer -- a dedicated submodule whose output
+    IS the post-residual hidden state), so the hardcoded reft_component_path
+    above is safe and is used as-is for backward compatibility with EXP-5.
+
+    NeoBERT's module tree is different and NOT part of the public
+    `transformers` library (it's loaded via `trust_remote_code`, and the
+    Hugging Face Hub copy of its modeling code is not pinned/inspectable
+    ahead of time the way a released `transformers` architecture is): its
+    encoder stack is `transformer_encoder` (an nn.ModuleList of
+    `EncoderBlock`s), and each block has no separate "output" submodule --
+    the residual add happens inline in EncoderBlock.forward(), so the block
+    itself (whose forward() return value IS the post-residual hidden state)
+    is the right interception point, not some child of it.
+
+    Rather than hardcode a guessed dotted path for NeoBERT (wrong by even one
+    level of nesting and pyreft fails after Phase-1 LoRA has already finished
+    training -- an expensive way to find out), this WALKS the model's actual
+    module registry via named_modules() and finds whichever module path ends
+    in "transformer_encoder.<layer_target>", so it's correct regardless of
+    exactly how many wrapper levels (peft's "base_model.model.", our own
+    "backbone.", NeoBERT's own internal "model." prefix, etc.) sit above it.
+    Raises immediately with a clear message (before any Phase-2 training
+    starts) if no matching module is found, rather than letting pyreft fail
+    with a more cryptic KeyError deeper inside get_reft_model().
+    """
+    if not _is_neobert_model(model_name):
+        return reft_component_path(layer_target)
+
+    suffix = f"transformer_encoder.{layer_target}"
+    matches = [name for name, _ in lora_model.named_modules() if name.endswith(suffix)]
+
+    if not matches:
+        available = sorted(
+            {name for name, _ in lora_model.named_modules() if "transformer_encoder" in name}
+        )
+        raise RuntimeError(
+            f"[reft] Could not find a module path ending in '{suffix}' in the "
+            f"LoRA-wrapped NeoBERT model's module tree (needed for EXP-8's ReFT phase). "
+            f"NeoBERT's Hub modeling code may have changed since this was written. "
+            f"Module paths containing 'transformer_encoder' that WERE found: "
+            f"{available[:20]}{'...' if len(available) > 20 else ''}. "
+            f"Update resolve_reft_component_path in models.py to match the current structure."
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"[reft] Ambiguous: found {len(matches)} module paths ending in '{suffix}' "
+            f"({matches}) -- expected exactly one. Refusing to guess which one is correct."
+        )
+    return matches[0]
 
 
 def attach_reft_to_lora_model(
@@ -362,11 +424,16 @@ def attach_reft_to_lora_model(
     reft_rank: int = 4,
     layer_target: int = 4,
     freeze_previous_phase: bool = True,
+    model_name: str = DEFAULT_CODE_MODEL,
 ):
     """
     HEFT Phase 2. Takes an already Phase-1-trained LoRA model (as returned by
     get_lora_model / create_lora_sequence_classifier) and attaches a LoReFT
     intervention on top of it.
+
+    `model_name` is used only to pick the right component-path resolution
+    strategy (see resolve_reft_component_path) -- it does not affect which
+    weights are loaded, since `lora_model` is already an instantiated model.
 
     Freezing behaviour:
       - `freeze_previous_phase=True` explicitly freezes the LoRA adapter
@@ -384,7 +451,7 @@ def attach_reft_to_lora_model(
         freeze_lora_parameters(lora_model)
 
     hidden_size = int(lora_model.base_model.model.backbone.config.hidden_size)
-    component_path = reft_component_path(layer_target)
+    component_path = resolve_reft_component_path(lora_model, layer_target, model_name)
 
     # NOTE: pyreft.ReftConfig expects `representations` as plain dict(s), NOT a
     # pyreft.RepresentationConfig object -- no such class exists in pyreft's
