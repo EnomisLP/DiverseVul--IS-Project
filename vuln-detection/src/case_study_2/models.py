@@ -392,6 +392,42 @@ def resolve_reft_component_path(lora_model: nn.Module, layer_target: int, model_
     Raises immediately with a clear message (before any Phase-2 training
     starts) if no matching module is found, rather than letting pyreft fail
     with a more cryptic KeyError deeper inside get_reft_model().
+
+    --- FIX (trailing ".output" is required, and it is NOT a real submodule)
+    The walked path above resolves to the *block itself*
+    ("...transformer_encoder.<layer_target>", an EncoderBlock instance) --
+    that part is correct per the reasoning above. But pyreft/pyvene's
+    `component` string is not just "which module" -- the trailing token
+    ("output"/"input"/etc, after the final ".") is a SEPARATE piece of
+    information pyvene's get_module_hook() parses off the string to decide
+    *which hook type* to register (register_forward_hook to capture the
+    module's return value vs. register_forward_pre_hook to capture its
+    input). Without a trailing type token pyvene never determines a hook
+    type at all, and the very next line that reads it
+    (`getattr(module, hook_type)`) raises `UnboundLocalError: local variable
+    'hook_type' referenced before assignment` -- which is exactly the error
+    this fix resolves; it also matches the crash signature seen in the
+    EXP-8 smoke test (Cell 11), which failed inside
+    attach_reft_to_lora_model() -> pyreft.get_reft_model() with that same
+    UnboundLocalError.
+
+    Crucially, ".output" here is a *symbolic* suffix, not a literal
+    attribute lookup -- pyreft's own README uses the identical convention
+    for peft-wrapped Llama decoder layers
+    (`f"base_model.model.model.layers[{l}].output"`), and
+    `LlamaDecoderLayer` has no literal `.output` submodule either. pyvene
+    strips the suffix before resolving the real module via
+    getattr_for_torch_module() on the *prefix*, so appending ".output" is
+    correct and safe even though EncoderBlock (like LlamaDecoderLayer) has
+    no submodule actually named "output" -- it tells pyvene "hook this
+    module's forward-pass return value", which is exactly the
+    post-residual hidden state we want per the reasoning above.
+
+    NOTE: because ".output" here is symbolic, `model.get_submodule(path)`
+    will NOT resolve on the string this function returns -- if you want to
+    sanity-check the path against the real module tree (as Section 10 of
+    the EXP-8 notebook does), strip the trailing ".output"/".input" first,
+    e.g. `path.rsplit(".", 1)[0]`.
     """
     if not _is_neobert_model(model_name):
         return reft_component_path(layer_target)
@@ -416,7 +452,12 @@ def resolve_reft_component_path(lora_model: nn.Module, layer_target: int, model_
             f"[reft] Ambiguous: found {len(matches)} module paths ending in '{suffix}' "
             f"({matches}) -- expected exactly one. Refusing to guess which one is correct."
         )
-    return matches[0]
+    # ".output" is a symbolic suffix pyvene/pyreft parse off the component
+    # string to pick a hook type (forward hook on the module's return value)
+    # -- see the FIX note in this function's docstring. It does NOT need to
+    # (and for NeoBERT's EncoderBlock, does not) correspond to a real
+    # submodule attribute.
+    return matches[0] + ".output"
 
 
 def attach_reft_to_lora_model(
