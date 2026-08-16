@@ -33,7 +33,13 @@ def train_lora_model(
     code_column="normalized_code",
     max_length=512,
     verbose=True,
-    log_every_steps=50,
+    # 500 (not the per-step-friendly 50) because this default is inherited by
+    # the nested rank search and canonical retrain, which each run many
+    # epochs across many folds/candidates -- at 50 that produced hundreds of
+    # near-duplicate "step N/M" lines per run with no added signal beyond the
+    # per-epoch summary line. Interactive/short runs (e.g. the smoke test)
+    # can still pass a smaller value explicitly.
+    log_every_steps=500,
     log_prefix="",
     # --- FIX (see case_study_2/training_utils.py header for full context) --
     # `epochs` is now a CEILING (max_epochs), not a fixed count: training

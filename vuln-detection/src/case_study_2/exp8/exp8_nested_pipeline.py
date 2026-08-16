@@ -182,7 +182,7 @@ def run_exp8_nested_rank(
     fold_ids = sorted(development_manifest[config.fold_column].unique().tolist())
     print(f"[nested] Starting EXP-8 nested rank search over {len(fold_ids)} outer folds, rank_grid={config.rank_grid}")
     print(
-        f"[nested] Search phase: {config.search_epochs} epoch(s)/phase, single held-out split | "
+        f"[nested] Search phase: {config.search_max_epochs} epoch(s)/phase, single held-out split | "
         f"Refit phase: {config.lora_epochs} LoRA + {config.reft_epochs} ReFT epoch(s), full training"
     )
 

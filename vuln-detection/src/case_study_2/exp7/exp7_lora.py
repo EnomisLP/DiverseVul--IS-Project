@@ -33,7 +33,12 @@ def train_lora_model(
     code_column="normalized_code",
     max_length=512,
     verbose=True,
-    log_every_steps=50,
+    # 500, not 50 -- inherited by the nested rank search / canonical retrain,
+    # which run many epochs across many folds/candidates; 50 produced
+    # hundreds of near-duplicate "step N/M" lines per run with no signal
+    # beyond the per-epoch summary. Short/interactive runs (smoke test) can
+    # still pass a smaller value explicitly.
+    log_every_steps=500,
     log_prefix="",
     # --- FIX (see case_study_2/training_utils.py header for full context) --
     # EXP-7 (NeoBERT, 28 layers) was inheriting the same fixed epoch budget

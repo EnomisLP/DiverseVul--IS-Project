@@ -76,7 +76,12 @@ def train_heft_model(
     code_column="normalized_code",
     max_length=512,
     verbose=True,
-    log_every_steps=50,
+    # 500, not 50 -- both LoRA and ReFT phases inherit this default, and the
+    # nested rank search / canonical retrain run many epochs of BOTH phases
+    # across many folds/candidates; 50 produced thousands of near-duplicate
+    # "step N/M" lines per run with no signal beyond the per-epoch summary.
+    # Short/interactive runs (smoke test) can still pass a smaller value.
+    log_every_steps=500,
     log_prefix="",
     reft_rank=4,
     # --- FIX (backbone-appropriate default) --------------------------------
