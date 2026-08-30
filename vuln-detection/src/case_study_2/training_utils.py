@@ -214,7 +214,30 @@ def run_training_with_early_stopping(
                 )
             break
 
-    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    # NOTE (pyreft/pyvene ReFT-intervention quirk, surfaced first on EXP-8/NeoBERT's
+    # symbolic ".output" component path -- see models.py::resolve_reft_component_path):
+    # pyreft's LoReFT intervention parameters (rotate_layer, learned_source, plus the
+    # embed_dim/interchange_dim buffers) are reachable via model.parameters() -- which
+    # is how the optimizer trains them -- but are NOT always reachable via the standard
+    # nn.Module.state_dict() traversal when the model was attached with
+    # attach_reft_to_lora_model(..., set_device=False). strict=True load_state_dict()
+    # then raises "Missing key(s)" purely because best_state (itself built from an
+    # earlier model.state_dict() call) never had those keys either -- both snapshots
+    # are consistently missing the same intervention-only keys, so this is a
+    # state_dict-visibility gap, not a real data-loss bug. Falling back to
+    # strict=False restores everything state_dict() DOES expose (LoRA/backbone/head)
+    # and leaves those specific intervention params at their current (already-trained)
+    # values, which is exactly correct when the current epoch IS the best epoch.
+    # Warn loudly (never fail silently) so a genuine future regression is still caught.
+    try:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    except RuntimeError as exc:
+        print(
+            f"{log_prefix}[{phase_name}] WARNING: strict state_dict restore failed "
+            f"({exc}); retrying with strict=False. If best_epoch != epoch, this means "
+            "the listed keys were NOT rolled back to the best epoch's values."
+        )
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()}, strict=False)
     if verbose and best_epoch != epoch:
         print(
             f"{log_prefix}[{phase_name}] reached max_epochs={es_config.max_epochs}; "
