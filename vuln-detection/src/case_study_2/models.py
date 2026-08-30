@@ -134,6 +134,27 @@ def load_code_encoder(
         kwargs["torch_dtype"] = dtype
 
     if is_neobert:
+        # Mandatory Track-B safeguard (found via device-side CUDA assert
+        # while running EXP-8's official nested rank search at real batch
+        # sizes -- never surfaced on the tiny smoke-test sample). PyTorch's
+        # OWN native torch.nn.functional.scaled_dot_product_attention (NOT
+        # the separate flash-attn PyPI package this project deliberately
+        # does not install) auto-selects among its own flash / memory-
+        # efficient / math backends based on hardware+dtype heuristics.
+        # NeoBERT's remote modeling code calls this function directly with a
+        # boolean attention mask in its padded "fall back to SDPA" branch --
+        # the same safe, non-packed path use_unpadding=False below is meant
+        # to guarantee -- but on this environment (torch 2.5.1+cu121 / A100)
+        # the fused flash/memory-efficient backends crashed with
+        # "RuntimeError: CUDA error: device-side assert triggered" on real
+        # (non-toy) batches. Forcing the math (reference, unfused) backend
+        # trades some speed for guaranteed-correct attention on masked,
+        # variable-length batches, consistent with this project's existing
+        # preference for correctness over speed in NeoBERT's attention path.
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+
         # Load + patch the config explicitly (rather than relying on
         # AutoModel.from_pretrained's implicit config loading) so the
         # unpadding override in _apply_neobert_config_overrides is guaranteed
