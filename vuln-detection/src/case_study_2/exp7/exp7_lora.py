@@ -101,7 +101,7 @@ def train_lora_model(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    return np.array(all_scores), model
+    return np.array(all_scores), model, history
 
 
 def score_model(model, df, tokenizer, device, code_column="normalized_code",
