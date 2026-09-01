@@ -227,7 +227,7 @@ def run_exp7_nested_rank(
             rank_t0 = time.time()
             print(f"[nested] --- evaluating rank candidate {rank_candidate} ---")
 
-            val_scores, tmp_model = train_lora_model_safe(
+            val_scores, tmp_model, _ = train_lora_model_safe(
                 search_train_df, search_val_df, tokenizer, rank=rank_candidate,
                 epochs=config.search_epochs, batch_size=config.train_batch_size,
                 grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
@@ -253,7 +253,7 @@ def run_exp7_nested_rank(
 
         print(f"[nested] --- final refit on full outer_train, rank={optimal_rank}, {config.epochs} epochs ---")
         refit_t0 = time.time()
-        outer_val_scores, final_outer_model = train_lora_model_safe(
+        outer_val_scores, final_outer_model, _ = train_lora_model_safe(
             outer_train_df, outer_val_df, tokenizer, rank=optimal_rank,
             epochs=config.epochs, batch_size=config.train_batch_size,
             grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
@@ -391,6 +391,7 @@ def run_exp7_canonical_retrain(
     # from scratch just to redo a scoring pass. If a saved adapter already
     # exists at this path, reload it and skip straight to scoring instead.
     canonical_model_path = output_dir / "final_canonical_lora_model"
+    training_history_path = output_dir / "exp7_canonical_training_history.csv"
     if canonical_model_path.exists():
         from peft import PeftModel
         from case_study_2.models import CodeSequenceClassifier, DEFAULT_NEOBERT_MODEL
@@ -410,7 +411,7 @@ def run_exp7_canonical_retrain(
         )
         t0 = time.time()
 
-        _, global_model = train_lora_model_safe(
+        _, global_model, canonical_training_history = train_lora_model_safe(
             canonical_train_df, canonical_val_df, tokenizer, rank=selected_rank,
             epochs=config.epochs, batch_size=config.train_batch_size,
             grad_accum_steps=config.grad_accum_steps, eval_batch_size=config.eval_batch_size,
@@ -421,7 +422,9 @@ def run_exp7_canonical_retrain(
             min_epochs=config.min_epochs,
         )
         global_model.save_pretrained(canonical_model_path)
+        pd.DataFrame(canonical_training_history).to_csv(training_history_path, index=False)
         print(f"[canonical] Training done in {(time.time()-t0)/60:.1f} min | model saved to {canonical_model_path}")
+        print(f"[canonical] Per-epoch training history saved to {training_history_path}")
 
     # Single, no-gradient scoring pass over the frozen outer holdout with the
     # selected (best-val-PR-AUC) checkpoint. This is the ONLY point in the
@@ -445,7 +448,7 @@ def run_exp7_canonical_retrain(
     gc.collect()
     torch.cuda.empty_cache()
 
-    return {"holdout_predictions": holdout_predictions}
+    return {"holdout_predictions": holdout_predictions, "training_history_path": training_history_path}
 
 
 def run_exp7_holdout_evaluation(
