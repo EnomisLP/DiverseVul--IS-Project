@@ -6,9 +6,16 @@ that the grouped CV / holdout split was built to protect, so every
 interval here resamples whole projects with replacement, never rows.
 
 Design decisions (see project discussion, do not relax without re-reading it):
-- Only threshold-independent metrics are supported (PR-AUC, ROC-AUC).
-  Precision/recall/F1/MCC depend on an arbitrary fixed threshold and are
-  intentionally excluded from CI computation.
+- Threshold-independent metrics (PR-AUC, ROC-AUC) are computed directly on
+  y_score. Threshold-dependent metrics (precision, recall, F1) are also
+  supported, but ONLY at a single, explicitly fixed decision threshold
+  (`threshold`, default 0.5 -- the same fixed threshold used elsewhere in
+  this project's reporting, see PDD Section 7.5). Reporting these without a
+  CI is misleading given the project-block resampling variance already
+  observed for PR-AUC; unlike PR-AUC/ROC-AUC, their CI additionally reflects
+  the arbitrariness of that fixed threshold choice, not sampling variance
+  alone -- callers should not treat a wide precision/recall/F1 interval as
+  equivalent evidence to a PR-AUC interval of the same width.
 - Percentile method, not normal-approximation: the bootstrap distribution
   of PR-AUC under a rare positive class can be skewed.
 - Degenerate resamples (no positive class, or all-positive) are dropped
@@ -31,16 +38,49 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
-CI_MODULE_VERSION = "cs1-confidence-intervals-v1"
+CI_MODULE_VERSION = "cs1-confidence-intervals-v2"
 
 REQUIRED_CI_COLUMNS = ("project", "label", "y_score")
 
+# Threshold-independent: computed directly on the continuous y_score.
 SUPPORTED_METRICS: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
     "average_precision_pr_auc": average_precision_score,
     "roc_auc": roc_auc_score,
 }
+
+# Threshold-dependent: y_score is first binarized at `threshold` (see
+# _resolve_metric_fn). zero_division=0 avoids sklearn warnings/NaNs on
+# degenerate bootstrap resamples with zero predicted positives.
+THRESHOLD_METRICS: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+    "precision": lambda y_true, y_pred: precision_score(y_true, y_pred, zero_division=0),
+    "recall": lambda y_true, y_pred: recall_score(y_true, y_pred, zero_division=0),
+    "f1": lambda y_true, y_pred: f1_score(y_true, y_pred, zero_division=0),
+}
+
+ALL_METRICS = tuple(sorted(set(SUPPORTED_METRICS) | set(THRESHOLD_METRICS)))
+
+
+def _resolve_metric_fn(metric: str, threshold: float) -> Callable[[np.ndarray, np.ndarray], float]:
+    """Returns a (y_true, y_score) -> float callable for `metric`.
+
+    Threshold-dependent metrics are wrapped to binarize y_score at
+    `threshold` first, so every entry in SUPPORTED_METRICS/THRESHOLD_METRICS
+    can be called uniformly as metric_fn(y_true, y_score) everywhere below.
+    """
+    if metric in SUPPORTED_METRICS:
+        return SUPPORTED_METRICS[metric]
+    if metric in THRESHOLD_METRICS:
+        thresholded_fn = THRESHOLD_METRICS[metric]
+        return lambda y_true, y_score: thresholded_fn(y_true, (np.asarray(y_score) >= threshold).astype(int))
+    raise ValueError(f"Unsupported metric '{metric}'. Supported: {list(ALL_METRICS)}.")
 
 
 def _require_ci_columns(frame: pd.DataFrame) -> None:
@@ -87,15 +127,15 @@ def bootstrap_metric_ci(
     confidence: float = 0.95,
     random_state: int = 42,
     min_positive_count: int = 1,
+    threshold: float = 0.5,
 ) -> BootstrapCIResult:
-    """Project-block bootstrap CI for a single threshold-independent metric."""
+    """Project-block bootstrap CI for one metric (threshold-independent or not).
+
+    `threshold` only applies to threshold-dependent metrics (precision,
+    recall, f1); ignored for average_precision_pr_auc / roc_auc.
+    """
     _require_ci_columns(predictions)
-    if metric not in SUPPORTED_METRICS:
-        raise ValueError(
-            f"Unsupported metric '{metric}'. Supported: {sorted(SUPPORTED_METRICS)}. "
-            "Threshold-dependent metrics are intentionally excluded, see module docstring."
-        )
-    metric_fn = SUPPORTED_METRICS[metric]
+    metric_fn = _resolve_metric_fn(metric, threshold)
 
     point_estimate = float(metric_fn(predictions["label"], predictions["y_score"]))
 
@@ -169,17 +209,18 @@ def paired_bootstrap_metric_ci(
     confidence: float = 0.95,
     random_state: int = 42,
     min_positive_count: int = 1,
+    threshold: float = 0.5,
 ) -> PairedBootstrapCIResult:
     """Paired project-block bootstrap CI on the difference between two experiments.
 
     Both prediction frames must cover the same partition (identical set of
     projects), since the same resampled groups are used for both sides.
+    `threshold` only applies to threshold-dependent metrics (precision,
+    recall, f1); ignored for average_precision_pr_auc / roc_auc.
     """
     _require_ci_columns(predictions_a)
     _require_ci_columns(predictions_b)
-    if metric not in SUPPORTED_METRICS:
-        raise ValueError(f"Unsupported metric '{metric}'. Supported: {sorted(SUPPORTED_METRICS)}.")
-    metric_fn = SUPPORTED_METRICS[metric]
+    metric_fn = _resolve_metric_fn(metric, threshold)
 
     groups_a = set(predictions_a["project"].unique())
     groups_b = set(predictions_b["project"].unique())
