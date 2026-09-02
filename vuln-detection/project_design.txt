@@ -1,592 +1,334 @@
 REFERENCES:
 
-Adapting Large Language Models for Parameter-Efficient Log Anomaly Detection, Y.F. Lim, Jiawen Zhu, Guansong Pang, 11 marzo 2025 (presentato alla conferenza PAKDD)
-(Paper for ReFT)
-_______________________________________________________________________________________________________________
-
-FRLog: Log Anomaly Detection Based on Three-Stage Training with Reft Fine-Tuning for Large Language Model, Keyuan Qiu, Zhejie Xu, Tao Luo, Ruru Liu, Pengjin Liu, Feng Chen, 9 febbraio 2026 (pubblicato sulla rivista scientifica internazionale JAISCR)
-(Paper for ReFT)
-_______________________________________________________________________________________________________________
-
 DiverseVul: A New Vulnerable Source Code Dataset for Deep Learning Based Vulnerability Detection, Yizheng Chen, Zhoujie Ding, Lamya Alowain, Xinyun Chen, David Wagner, Published at RAID 2023
-(Paper that used old dataset DiverseVul, they used Full-Fine Tuning since at that time models had low parameters)
+(Paper that introduced the original DiverseVul dataset and its project-grouped, unseen-project evaluation protocol)
 _______________________________________________________________________________________________________________
 
 Evaluating LLaMA 3.2 for Software Vulnerability Detection (pubblicato a inizio 2025 e presentato alla EICC 2025 - European Interdisciplinary Cybersecurity Conference), José Gonçalves, Miguel Silva, Bernardo Cabral, Tiago Dias, Eva Maia, Isabel Praça, Ricardo Severino, Luís Lino Ferreira
-(Paper that used new RDiverseVul and LoRA for Fine Tuning)
+(Paper that introduced RDiverseVul, the refined dataset used in this project, and evaluated LoRA fine-tuning on it)
 _______________________________________________________________________________________________________________
 
-HEFT: A Coarse-to-Fine Hierarchy for Enhancing the Efficiency and Accuracy of Language Model Reasoning (Brennen Hill, 2025)
-(Paper for HEFT - LoRA + ReFT)
+LoRA: Low-Rank Adaptation of Large Language Models, Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen, 2021
+(Paper describing the Low-Rank Adaptation technique used for parameter-efficient fine-tuning in this project)
 _______________________________________________________________________________________________________________
 
 ================================================================================
                      PROJECT DESIGN DOCUMENT (PDD)
 ================================================================================
-PROJECT TITLE: INTELLIGENT SYSTEM FOR SOFTWARE VULNERABILITY DETECTION 
-               VIA NEOBERT, CODEBERTA, RDIVERSEVUL, AND HEFT
+PROJECT TITLE: INTELLIGENT SYSTEM FOR SOFTWARE VULNERABILITY DETECTION
+               VIA CLASSICAL LEXICAL MODELS AND NEOBERT
 AUTHOR/ROLE:   Lead AI Architecture & Cyber-Security Systems Engineer
-DATE:          June 21, 2026
-UPDATED:       August 12, 2026 (see IMPLEMENTATION ADDENDUM, Section 7, for the
-               full list of deviations between this design and the as-built
-               system, and why each was made)
-STATUS:        Approved / Architecture Specification -- Implementation Complete
+STATUS:        Architecture Specification -- Implementation Complete
 ================================================================================
 
 --------------------------------------------------------------------------------
 1. IDEA DEFINITION & THEORETICAL FOUNDATION
 --------------------------------------------------------------------------------
-The primary objective of this project is to research, design, and deploy an 
-Intelligent System (IS) capable of predictive software vulnerability detection 
-directly within C/C++ source code. As open-source and proprietary software 
-ecosystems expand, manual code auditing and legacy static application security 
-testing (SAST) tools fail to capture complex, multi-line semantic flows that 
-signal exploitable vulnerabilities. This project addresses these limitations 
-by framing vulnerability detection as an advanced sequence classification challenge.
+The primary objective of this project is to research, design, and evaluate an
+Intelligent System (IS) capable of predictive software vulnerability detection
+directly within C/C++ source code. As open-source and proprietary software
+ecosystems expand, manual code auditing and legacy static application security
+testing (SAST) tools fail to capture complex, multi-line semantic flows that
+signal exploitable vulnerabilities. This project addresses these limitations
+by framing vulnerability detection as a binary sequence classification problem,
+and compares two families of approach on the same dataset and the same
+evaluation protocol:
 
-To validate the real-world performance of modern methods and ground the system 
-within standard curriculum methodologies, this project is structured as a 
-two-track comparative study:
+Case Study 1: The Classical Lexical Pipeline
+This pipeline relies on explicit lexicon-based representations extracted from
+source code tokens (word- and character-level TF-IDF, plus a deterministic
+structural feature vector), routed into two classical/shallow classifiers: a
+class-weighted L2 Logistic Regression and a shallow Multi-Layer Perceptron
+(MLP). This decouples the representation step entirely from the downstream
+classification model.
 
-Track A: The Standard Data Mining Pipeline
-This baseline pipeline focuses on traditional manual feature engineering. It utilizes 
-explicit lexicon-based representations extracted from source code tokens, routing 
-them into shallow classifiers. This decouples the representation step entirely from 
-the downstream classification model.
-
-Track B: The Advanced Deep Representation Pipeline
-This pipeline explores deep semantic embedding via a bidirectional transformer 
-neural backbone. Rather than manual feature design, the model automatically infers 
-complex control-flow structures. It uses the HEFT (Hierarchical Efficient Fine-Tuning) 
-paradigm, originally proposed by Brennen Hill (2025), adapted for a bidirectional 
-encoder backbone.
-
-  [IMPLEMENTATION NOTE] Track B was executed against TWO backbones, not one:
-  CodeBERTa-small-v1 (84M parameters, RoBERTa-style, pretrained on source code)
-  and NeoBERT-250M (the originally-designed backbone). This turns Track B into
-  its own internal 2 (backbone) x 3 (method) comparative study rather than a
-  single fixed pipeline. See Section 5.2 and Section 7.1 for the full
-  justification and what this comparison revealed.
-
-HEFT orchestrates two sequential Parameter-Efficient Fine-Tuning (PEFT) techniques 
-to balance global domain alignment and high-precision activation steering:
-
-Phase 1 (Coarse-Grained / LoRA):
-  - Target: Macro weight space of the backbone's multi-head self-attention 
-    projections (query, key, value, and output projections; the exact
-    projection names differ by backbone architecture -- see Section 7.2).
-  - Mechanism: Low-Rank Adaptation (LoRA) decomposes weight updates by injection 
-    of low-rank matrices, expressed as: W = W_0 + ΔW = W_0 + (B × A)
-  - Objective: Align the pre-trained model with the general syntax structures 
-    and specialized security semantics of C/C++ code.
-
-Phase 2 (Fine-Grained / ReFT):
-  - Target: Surgical, low-rank representation-space steering directly on the 
-    hidden states of an intermediate transformer layer.
-  - Mechanism: Representation Fine-Tuning (ReFT / LOREFT) applies linear 
-    interventions to hidden states via: h_intervened = h + R^T (W_reft · h + b - R · h)
-  - Positioning: Interventions are executed on the output of a single target
-    transformer layer, chosen per backbone (see Section 7.2 for why "strictly
-    after Pre-RMSNorm" -- correct for NeoBERT's architecture -- does not
-    literally apply to CodeBERTa, which uses standard LayerNorm, and why the
-    interception point on NeoBERT itself required a different resolution
-    strategy than originally assumed).
-  - Objective: Isolate and amplify subtle vulnerability patterns without causing 
-    catastrophic forgetting.
+Case Study 2: The Deep Representation Pipeline (NeoBERT)
+This pipeline explores deep semantic embeddings via NeoBERT, a 250M-parameter
+bidirectional transformer encoder. Two ways of adapting the pretrained
+backbone to this task are compared:
+  - A frozen-encoder linear probe: NeoBERT's weights are never updated; a
+    mean-pooled sentence embedding is classified by a logistic regression
+    probe trained on top.
+  - LoRA (Low-Rank Adaptation) fine-tuning: NeoBERT's attention projections
+    are adapted via low-rank update matrices, expressed as
+    W = W_0 + Delta_W = W_0 + (B x A), while the base weights stay frozen.
+    Only the low-rank adapters (and the classification head) are trained.
 
 --------------------------------------------------------------------------------
 2. IDENTIFICATION OF THE ML/AI TASK(S)
 --------------------------------------------------------------------------------
-To satisfy the system's structural and functional security requirements, the 
-vulnerability detection problem is mapped to the following core Machine Learning 
-tasks:
+The vulnerability detection problem is mapped to the following core Machine
+Learning task:
 
-Primary Task (Data Mining & Predictive Core): Binary Classification
-  - Description: The system ingests a segmented block of source code and 
-    computes a deterministic probability indicating whether the block contains 
-    a known software vulnerability (CWE violation).
-  
-  - Input Formalization (Track A):
-    A fixed-length numeric vector combining lexicon-based TF-IDF representations
-    and deterministic structural/security-API features extracted statically
-    from identifier-abstracted function strings (see Section 4.4 for the full,
-    as-built specification -- richer than a single TF-IDF vector).
-    
-  - Input Formalization (Track B):
-    A normalized C/C++ function tokenized into a numeric array of token IDs, 
-    attention masks, and positional tensors.
+Primary Task: Binary Classification
+  - Description: The system ingests one C/C++ function and computes a
+    probability indicating whether it contains a known vulnerability.
 
-    [IMPLEMENTATION NOTE] Bounded by a 512-token context window for BOTH
-    backbones, not the 4,096-token window NeoBERT natively supports. See
-    Section 4.2 for the EDA finding that justified this and Section 7.1 for
-    why NeoBERT's extended context did not end up being the deciding factor
-    it was expected to be.
+  - Input Formalization (Case Study 1):
+    A fixed-length numeric vector combining word-level TF-IDF, character-level
+    TF-IDF, and (for the MLP) a 54-dimension deterministic structural feature
+    vector, all extracted from the function's identifier-abstracted text (see
+    Section 4.4 for the full specification).
+
+  - Input Formalization (Case Study 2):
+    The function's normalized (or identifier-abstracted) text, tokenized into
+    a numeric array of token IDs and an attention mask, truncated/padded to a
+    fixed 512-token context window.
 
   - Output Formalization:
-    A discrete binary label Y ∈ {0, 1} and a continuous confidence score P, 
-    defined as:
-        Y = 1: Indicates a vulnerable code sample containing an exploit chain.
-        Y = 0: Indicates a secure, structurally stable code sample.
-        P (Confidence Score): A scalar value in the range [0.0, 1.0], derived 
-                              from the final classification output layer, 
-                              representing the empirical probability of vulnerability.
+    A discrete binary label Y in {0, 1} and a continuous confidence score P:
+        Y = 1: the function contains a vulnerability.
+        Y = 0: the function is secure.
+        P: a scalar in [0.0, 1.0], the model's predicted probability of Y = 1.
+           This is a risk-ranking score derived from a class-weighted
+           objective, not a calibrated real-world probability.
 
 --------------------------------------------------------------------------------
 3. SELECTION OF A SUITABLE DATASET
 --------------------------------------------------------------------------------
-The dataset selected for model training, cross-validation, and rigorous benchmark 
-testing is RDiverseVul (Refined DiverseVul), published in February 2025.
+The dataset used for model training, cross-validation, and benchmark testing
+is RDiverseVul (Refined DiverseVul), a cleaned derivative of the original
+DiverseVul dataset (Chen et al., RAID 2023).
 
-KDD Phase Alignment: 
+KDD Phase Alignment:
   - Data Selection and Initial Preprocessing.
 
-Justification and Comparative Superiority:
-The original DiverseVul dataset (published at RAID 2023) was a significant step 
-forward in size, but contained deep data-quality anomalies that severely limited 
-high-capacity neural models. These anomalies included comment-only code snippets, 
-identical function declarations containing conflicting vulnerability labels 
-(label noise), and massive structural duplication. RDiverseVul explicitly 
-remediates these issues by filtering out 7,901 erroneous duplicate entries 
-that historically induced gradient confusion and artificial validation inflation 
-during training loops, yielding a pristine, high-fidelity security baseline.
+Justification:
+The original DiverseVul dataset was a significant step forward in size, but
+contained data-quality anomalies that limit high-capacity neural models:
+comment-only code snippets, identical function declarations with conflicting
+vulnerability labels (label noise), and structural duplication. RDiverseVul
+remediates these issues by filtering out erroneous duplicate entries, yielding
+a higher-fidelity security baseline.
 
-  [IMPLEMENTATION NOTE -- comparability caveat] The RDiverseVul paper (Gonçalves
-  et al., 2025) reports its headline F1=66% result on a class-BALANCED 10,000-row
-  subsample (5,000/5,000) with a RANDOM 70/15/15 split, not on the natural
-  class distribution with a project-grouped holdout. This project uses the
-  natural, imbalanced class distribution (~5.6% positive) with a strict
-  project-grouped holdout (unseen projects at test time), matching the
-  ORIGINAL DiverseVul paper's harder "unseen-project" evaluation scenario, not
-  RDiverseVul's easier balanced/random-split one. See Section 7.5 for the full
-  three-way comparison and why the two are not directly comparable numbers.
+This project evaluates on the natural, imbalanced class distribution (~5.6%
+positive) rather than a class-balanced subsample, and uses a project-grouped
+cross-validation protocol (no function from the same repository ever appears
+in both the training and the test portion of a fold). This matches the
+original DiverseVul paper's harder "unseen-project" evaluation scenario: a
+model that has never seen a project's coding style or conventions is
+evaluated on new functions from that same project.
+
+Given the compute cost of the full experimental matrix (Section 6) across
+five rotating cross-validation folds, the ~200,000+ row dataset is
+stratified-downsampled to approximately 20,000 rows (preserving the original
+~5.6% positive rate exactly), and every experiment trains and evaluates on
+this downsampled dataset.
 
 --------------------------------------------------------------------------------
-4. ANALYSIS AND EXPLORATION OF THE IDENTIFIED DATASET (EDA PLAN)
+4. ANALYSIS AND EXPLORATION OF THE IDENTIFIED DATASET (EDA)
 --------------------------------------------------------------------------------
-KDD Phase Alignment: 
+KDD Phase Alignment:
   - Data Cleaning, Exploratory Data Analysis, and Data Transformation.
 
-The Exploratory Data Analysis (EDA) framework is configured to analyze and 
-mitigate three specific structural attributes of the preprocessed RDiverseVul 
-dataset:
-
 4.1 Class Imbalance Analysis
-  - Challenge: Real-world software repositories exhibit extreme class distribution 
-    skews; secure source instances vastly outnumber vulnerable functions. The 
-    EDA will compute the exact mathematical scale of this imbalance across the 
-    dataset splits.
-  - Mitigation Strategy: To counteract the majority-class gradient dominance, the 
-    training codebase will implement custom class-weighted loss functions (such as 
-    Inverse-Frequency Class Weighting) applied directly to the classification 
-    objectives, ensuring minority class vectors exert sufficient optimization pull.
-  - [CONFIRMED, AS BUILT] Measured positive rate on the development/holdout
-    partitions is ~5.6%. Class-weighted loss (BCEWithLogitsLoss with pos_weight
-    for Track B; class_weight='balanced'/'balanced_subsample' for Track A) is
-    applied uniformly across all nine experiments (see Section 6.2).
+  - Real-world software repositories exhibit extreme class skew; secure
+    functions vastly outnumber vulnerable ones. The measured positive rate on
+    the (downsampled) dataset is ~5.6%.
+  - Mitigation: class-weighted training objectives are applied uniformly
+    across every experiment (BCEWithLogitsLoss with pos_weight = negative /
+    positive count for Case Study 2; class_weight='balanced' for Case Study
+    1's Logistic Regression and Case Study 2's linear probe), so the minority
+    (vulnerable) class exerts sufficient optimization pull.
 
 4.2 Sequence Length Distribution
-  - Challenge: Legacy sequence models were strictly constrained by small context 
-    windows (e.g., 512 tokens), forcing truncation of large functions.
-  - Exploration Matrix: The EDA will plot the density distribution of token 
-    lengths across all raw C/C++ functions.
-  - Model Adaptation: NeoBERT natively supports an extended context window of 
-    4,096 tokens utilizing Rotary Position Embeddings (RoPE) paired with Yet 
-    Another RoPE Extension (YaRE).
+  - Legacy sequence models are constrained by small context windows,
+    forcing truncation of large functions. The large majority of RDiverseVul
+    functions fall under 512 tokens, so a max_sequence_length of 512 is used
+    for NeoBERT, even though its architecture natively supports up to 4,096
+    tokens via Rotary Position Embeddings (RoPE) with the YaRE extension.
 
-  [IMPLEMENTATION NOTE] The EDA finding was that the large majority of
-  RDiverseVul functions fall under 512 tokens, so max_sequence_length=512 was
-  used for both Track B backbones (CodeBERTa and NeoBERT) rather than
-  exploiting NeoBERT's full 4,096-token budget. This was a deliberate,
-  EDA-justified choice, not an oversight -- but it does mean the project's
-  results do not test whether NeoBERT's long-context capability would help on
-  the tail of longer functions that DO get truncated at 512. Flagged as future
-  work in Section 7.6.
+4.3 CWE Distribution
+  - "Vulnerability" is an aggregate term encompassing distinct classes of
+    coding error, catalogued via Common Weakness Enumeration (CWE)
+    identifiers. Memory-safety-relevant CWE families (e.g. CWE-119, CWE-787,
+    CWE-476, CWE-125) are of particular interest given the C/C++ domain, and
+    are examined descriptively as part of the dataset's characterization.
 
-4.3 CWE Distribution Mapping
-  - Challenge: "Vulnerability" is an aggregate term encompassing distinct physical 
-    coding errors. The EDA will parse dataset metadata to map the continuous 
-    frequency distribution of the 150 Common Weakness Enumerations (CWEs).
-  - Target Focus: The evaluation framework will specifically isolate and track 
-    performance on highly critical, memory-unsafe CWE families:
-      * CWE-119: Improper Restriction of Operations within Bounds of a Memory Buffer
-      * CWE-787: Out-of-bounds Write
-      * CWE-476: Null Pointer Dereference
-      * CWE-125: Out-of-bounds Read
+4.4 TEXT PREPROCESSING AND CASE STUDY 1 FEATURE SPECIFICATION
 
-4.4 TRACK A FEATURE EXTRACTION SPECIFICATION (AS BUILT -- "IDABS" PIPELINE)
-  [REPLACES the originally-planned plain TF-IDF-only specification below with
-  what was actually implemented. The internal codebase name for this whole
-  pipeline is "IDABS" ("Identifier Abstraction"), reflected in the
-  experiment/notebook naming (EXP-0-IDABS, EXP-1-IDABS, etc. -- see Section 6.2).]
+  Preprocessing is deterministic and row-independent (it depends only on a
+  function's own text, never on labels or on other rows), so it runs once on
+  the whole dataset, before any train/test split. It produces two parallel
+  text representations, compared side by side throughout the experimental
+  matrix:
 
-  Step 1 -- Identifier Abstraction (preprocessing, shared by all of Track A):
-    Before any vectorization, each function is passed through a deterministic
-    lexical abstraction pass (case_study_1/normalization_v3.py::abstract_identifiers)
-    that REPLACES:
-      - user-defined variable names          -> VAR1, VAR2, ...
-      - user-defined function calls/defs     -> FUNC1, FUNC2, ...
-      - struct/class/enum names              -> TYPE1, TYPE2, ...
-      - field/member names (after . or ->)   -> FIELD1, FIELD2, ...
-      - macro-like ALL-CAPS identifiers      -> MACRO1, MACRO2, ...
-    while PRESERVING C/C++ keywords, preprocessor directive names, built-in/std
-    types, a curated whitelist of security-relevant standard APIs (memory,
-    string, format, input functions), numeric literals, and all
-    operators/punctuation/line structure. This is a deliberate anti-leakage
-    control: it prevents the downstream lexical models from memorizing
-    project-specific variable/function naming conventions instead of learning
-    genuinely predictive lexical/structural patterns -- directly relevant given
-    the project-grouped, unseen-project holdout evaluation protocol.
+  a) Normalization (normalized_code): whitespace collapsing, line-ending and
+     blank-line normalization, applied via a hand-written C/C++-aware lexer
+     that recognizes string/char literals, comments, and identifiers so that
+     normalization never alters literal contents. Comments are preserved.
 
-  Step 2 -- Vectorization (differs by experiment, all downstream of Step 1):
-    a) Word-level TF-IDF over the abstracted token stream, n-grams n ∈ {1,2,3}
-       (min_df=3, max_df=0.995, max_features=50,000). Used by ALL of EXP-0/1/2.
-    b) Character-level TF-IDF, n-grams n ∈ {3,4} (min_df=8, max_df=0.995,
-       max_features=60,000), captures morphology TF-IDF word n-grams miss
-       (e.g. partial identifiers/casts survive abstraction differently).
-       Used by ALL of EXP-0/1/2, concatenated with (a) via sparse hstack.
-    c) A ~54-dimension deterministic structural/statistical feature vector
-       (case_study_1/exp1/static_features.py), computed directly from the
-       abstracted code: identifier/unique-identifier counts, control-flow
-       keyword counts (if/else/for/while/switch/goto/...), function-call
-       counts, cyclomatic-complexity proxy, brace/parenthesis/array-access
-       counts, pointer-declaration and cast-like-pattern counts, and CATEGORIZED
-       standard-API call counts (memory: malloc/free/memcpy/...; string:
-       strcpy/strcat/...; format: sprintf/printf/...; input: gets/scanf/read/...;
-       allocation vs. deallocation counts; assert-call counts). Used by
-       EXP-1 and EXP-2 ONLY (concatenated onto (a)+(b) via hstack); EXP-0 uses
-       (a)+(b) alone.
+  b) Identifier abstraction (abstracted_code_v1): built on top of (a) via
+     SCoPE2, a tree-sitter-based structural transformation tool. It removes
+     comments and replaces user-defined variable and function names with
+     anonymized placeholders, while preserving C/C++ keywords, standard
+     types, standard-library API names, numeric literals, and all
+     operators/punctuation/line structure. This is a deliberate anti-leakage
+     control: it prevents downstream lexical models from memorizing
+     project-specific naming conventions instead of learning genuinely
+     predictive lexical/structural patterns -- directly relevant given the
+     project-grouped evaluation protocol.
 
-  Final feature matrices:
-    X_lexical_EXP0 = hstack[ TFIDF_word(1,2,3-grams), TFIDF_char(3,4-grams) ]
-    X_lexical_EXP1 = X_lexical_EXP2 = hstack[ TFIDF_word, TFIDF_char, X_static(54-dim) ]
+  Attribute selection (fitting TF-IDF vocabularies and, for the MLP, fitting
+  TruncatedSVD) is a separate step that happens strictly after the
+  cross-validation split, fit on each fold's training partition only, and
+  applied (transform-only) to that fold's test partition. This preserves the
+  standard "attribute selection after the split" ordering: preprocessing
+  reduces the raw dataset, cross-validation splits it, and only then is any
+  data-dependent feature-selection step fit.
 
-  Objective (unchanged from the original plan): capture explicit keyword
-  distributions, API combinations, and structural token recurrences without
-  relying on context-aware hidden layer states -- achieved here through a
-  richer, project-leakage-resistant combination of representations rather
-  than TF-IDF alone.
+  Case Study 1 feature extraction (downstream of preprocessing):
+    a) Word-level TF-IDF over the (normalized or abstracted) token stream,
+       n-grams n in {1,2,3}, min_df and max_features selected per outer fold
+       via inner cross-validation (Section 6.2). Used by both Logistic
+       Regression and the MLP.
+    b) Character-level TF-IDF, n-grams n in {3,4}, min_df and max_features
+       likewise selected via inner cross-validation. Captures morphology that
+       word n-grams miss (e.g. pointer/array syntax, partial identifiers).
+       Concatenated with (a) via sparse hstack.
+    c) A 54-dimension deterministic structural/statistical feature vector,
+       computed directly from the source text: identifier and unique-
+       identifier counts, control-flow keyword counts (if/else/for/while/
+       switch/goto/...), function-call counts, a cyclomatic-complexity proxy,
+       brace/parenthesis/array-access counts, pointer-declaration and
+       cast-like-pattern counts, and categorized standard-API call counts
+       (memory, string, format, input, allocation/deallocation, assert).
+       Used only by the MLP, concatenated onto (a)+(b), after (a)+(b) are
+       further reduced to a dense representation via TruncatedSVD.
 
 --------------------------------------------------------------------------------
 5. SELECTION OF THE MOST SUITABLE ML/AI MODELS
 --------------------------------------------------------------------------------
-5.1 Track A Classifiers (Standard Baseline Track)
-  - Linear Model: Logistic Regression (SGDClassifier, log-loss)
-    * Type: Linear statistical baseline, alpha (L2 strength) selected via
-      nested cross-validation ("Nested Alpha Study" in the codebase).
-    * Justification: Interpretable, fast, strong baseline for high-dimensional
-      sparse lexical features.
-  - Classical Model: Random Forest
-    * Type: Classic ensemble bagging algorithm made of independent decision trees.
-    * Justification: Serves as a standard, highly stable textbook classifier that 
-      handles non-linear token-frequency interactions well and is highly resistant 
-      to overfitting on high-dimensional lexical features.
-  - Shallow DL Model: 3-Layer Multilayer Perceptron (MLP)
-    * Type: Feed-forward shallow neural network.
-    * Structure: Input Layer (Ingests X_lexical) -> Hidden Layer 1 (128 units + 
-      ReLU + Dropout p=0.3) -> Hidden Layer 2 (64 units + ReLU) -> Output Layer 
-      (1 unit with Sigmoid activation).
-    * Justification: Evaluates non-linear coordinate associations of manual 
-      lexicon features without structural transformer overhead.
-    * [AS BUILT] Trained with explicit validation-PR-AUC-based early stopping
-      (patience + min_delta, best-checkpoint restore) -- the only Track A/B
-      hand-written training loop in the original codebase that had this from
-      the start. It became the reference implementation copied into Track B's
-      shared training_utils.py after the undertraining issue described in
-      Section 7.3 was diagnosed there.
+5.1 Case Study 1 Classifiers
+  - Logistic Regression (SGDClassifier, log-loss, L2 penalty)
+    * Interpretable, fast, strong baseline for high-dimensional sparse
+      lexical features. The L2 strength (alpha) is selected via inner
+      cross-validation, per outer fold.
+  - Shallow Multi-Layer Perceptron (MLP)
+    * Structure: dense input (TruncatedSVD-reduced TF-IDF + 54 static
+      features) -> Hidden Layer 1 (ReLU) -> Hidden Layer 2 (ReLU) -> Output
+      (1 logit). Hidden layer sizes and learning rate are selected via inner
+      cross-validation, per outer fold.
+    * Trained with validation-PR-AUC-based early stopping (patience and
+      min_delta, best-checkpoint restoration).
 
-5.2 Track B Model Architecture (Advanced Pipeline Track)
+5.2 Case Study 2 Model: NeoBERT-250M
+  - Specifications: Chandar Research Lab; 250M parameters; 28 layers x 768
+    hidden dimensions; RoPE with YaRE; SwiGLU activations; Pre-RMSNorm.
+  - Two adaptation strategies are compared on the same backbone:
+    * Frozen linear probe: NeoBERT's weights are frozen; a mean-pooled
+      sentence embedding (computed once for the whole dataset, since a
+      frozen encoder has no train-only fitting step) is classified by an
+      L2-regularized Logistic Regression, with the regularization strength
+      (C) selected via inner cross-validation, per outer fold.
+    * LoRA fine-tuning: NeoBERT's attention projections are adapted via
+      low-rank matrices (rank 16, alpha 32 -- the standard alpha = 2 x rank
+      convention -- learning rate 2e-4, all fixed at literature-standard
+      values for encoder models of this size rather than searched, to keep
+      fine-tuning within a practical compute budget). Trained with
+      validation-PR-AUC-based early stopping, epochs capped at a ceiling
+      rather than run for a fixed count.
 
-  [IMPLEMENTATION NOTE] Executed against TWO backbones rather than one. See
-  Section 7.1 for the full rationale and empirical comparison.
-
-  Backbone 1 (primary, compute-budget-driven): CodeBERTa-small-v1
-    * Specifications: huggingface/CodeBERTa-small-v1; 84M parameters; 6 layers,
-      RoBERTa-style architecture (standard LayerNorm, not RMSNorm); pretrained
-      on CodeSearchNet (Go, Java, JavaScript, PHP, Python, Ruby -- notably
-      NOT C/C++).
-    * Justification: Fits comfortably within available GPU/VRAM budget; already
-      code-pretrained (unlike a generic text encoder), giving Phase-1 LoRA a
-      smaller domain gap to close even though its pretraining languages don't
-      include C/C++. Adopted as the practical first Track B backbone while
-      NeoBERT-250M access/compute was being resolved.
-
-  Backbone 2 (as originally designed): NeoBERT-250M
-    * Specifications: Chandar Research Lab; 250M parameters; 28 layers × 768 hidden 
-      dimensions; RoPE with YaRE; SwiGLU activations; Pre-RMSNorm; pretrained on
-      RefinedWeb (general English web text -- zero code exposure of any kind,
-      any language).
-    * Justification: Aligns with encoder standards close to classic text architectures 
-      while extending context capabilities up to 4,096 tokens, tracking long-range 
-      dependencies natively across entire files (context capability not fully
-      exercised in this project's experiments -- see Section 4.2).
-    * [FINDING] Despite being ~3x larger than CodeBERTa, NeoBERT underperformed
-      it on this task once undertraining was ruled out as a confound (see
-      Section 7.3). The leading hypothesis, consistent with Result 5 of the
-      original DiverseVul paper (Chen et al. 2023) -- code-specific pretraining
-      matters more than raw parameter count -- is that CodeBERTa's exposure to
-      ANY programming language during pretraining gives LoRA/ReFT a smaller gap
-      to close than NeoBERT's zero code exposure, regardless of scale. See
-      Section 7.1.
-
-Technical Codebase Safeguards & Mandatory Overrides:
-To guarantee training stability for Track B, the pipeline overrides baseline bugs:
-  1. NaN Training Bug Solution (GitHub Issue #11): Enforces explicit Float32 
-     precision tensors for attention outputs and classification heads, stabilizing 
-     mixed-precision optimization.
-     [AS BUILT] Additionally instrumented with an explicit runtime isfinite()
-     guardrail on pooled embeddings (used in the frozen-encoder linear-probe
-     experiments, EXP-3/EXP-6): if a NaN/Inf value is detected, the pipeline
-     raises immediately with a diagnostic message referencing this safeguard,
-     rather than silently propagating corrupted embeddings into the downstream
-     classifier.
-  2. Unpadding Attention Leakage Solution (GitHub Issue #7): Sets use_unpadding = False, 
-     employing strict multi-head attention masks to totally isolate padding tokens.
-     [VERIFIED, DOWNGRADED FROM "MANDATORY OVERRIDE" TO "CONFIRMED NON-ISSUE,
-     KEPT AS DEFENSIVE CHECK"] Per NeoBERT's own documentation, sequence
-     packing/unpadding only activates when flash-attention is installed. Since
-     this project deliberately does not install flash-attention for the Track B
-     backbones, NeoBERT already falls back to standard padded attention with the
-     HF attention_mask honored correctly, independent of this config flag. The
-     codebase still checks for and warns about a missing/unrecognized unpadding
-     flag on the loaded config (belt-and-braces), but this is not, in practice,
-     an active bug given the current dependency set.
+  Technical safeguards applied to NeoBERT:
+    1. Pooling and the classification head run in explicit float32
+       regardless of the ambient autocast dtype, to prevent a bf16/fp16
+       NaN/Inf produced upstream in NeoBERT's attention stack from being
+       baked into the trainable head via a half-precision matmul. Frozen
+       embeddings are additionally checked for finiteness at extraction
+       time, failing loudly rather than silently propagating corrupted
+       values downstream.
+    2. NeoBERT's fused flash/memory-efficient scaled-dot-product-attention
+       backends are disabled in favor of the reference (math) backend, and
+       sequence unpadding is disabled, both to guarantee correct, stable
+       attention on padded, variable-length batches.
 
 --------------------------------------------------------------------------------
 6. DESIGN, TEST, AND COMPARISON OF THE SELECTED MODELS
 --------------------------------------------------------------------------------
-This phase executes the Pattern Evaluation stage of the Knowledge Discovery in 
-Databases (KDD) process through a strictly partitioned experimental matrix to 
-evaluate standard vs. deep representation learning.
+This phase executes the Pattern Evaluation stage of the Knowledge Discovery
+in Databases (KDD) process through a strictly partitioned experimental
+matrix.
 
-6.1 DATASET PORTIONING & EVALUATION PROTOCOL (STRATIFIED K-FOLD)
-  - Validation Protocol: Grouped Stratified 5-Fold Cross-Validation.
-  - Holdout Partition: Before initializing the cross-validation loop, a clean 
-    20% subset of the raw RDiverseVul dataset is isolated and locked away as a 
-    pure Holdout Test Set. This partition remains completely unseen during all 
-    training and hyperparameter optimization steps.
-  - Portioning Mechanism: The remaining 80% of the dataset is portioned into 
-    K = 5 distinct, equal-sized subsets (Folds). The partition is "Grouped Stratified", 
-    meaning each fold maintains the exact same ratio of secure (Y=0) to 
-    vulnerable (Y=1) instances as the global distribution, neutralizing gradient 
-    biases caused by class imbalance, such that functions of same "Project" does not appear
-    within the same fold.
-  - The Rotating Loop: All models across Track A and Track B are trained and 
-    validated 5 distinct times. In each iteration, 4 folds are combined to serve 
-    as the Training Set, while the remaining rotating fold serves as the 
-    Validation Set (used to monitor convergence, adjust tree depth, or refine 
-    LoRA ranks).
-  - Final Evaluation Phase: Performance metrics (Precision, Recall, F1, PR-AUC) 
-    are macro-averaged across all 5 validation loops. The final optimized system 
-    configuration is then evaluated one last time against the untouched 20% 
-    Holdout Test Set to establish final generalization boundaries. All holdout
-    metrics are reported with 95% confidence intervals from a project-block
-    bootstrap (1,000 resamples), and cross-experiment differences are reported
-    via paired bootstrap on the same holdout partition.
+6.1 EVALUATION PROTOCOL: ROTATING, PROJECT-GROUPED, STRATIFIED 5-FOLD CV
+  - A single manifest is built once, on the (downsampled) dataset, via
+    scikit-learn's StratifiedGroupKFold(n_splits=5), grouped by source
+    repository ("project") and stratified by label. No function from the
+    same project ever appears in both the training and test portion of the
+    same fold. This manifest is shared identically by all four experiments.
+  - There is no separate fixed holdout partition: every one of the 5 folds
+    takes a turn as the test set, with the other 4 folds forming that
+    iteration's training partition.
+  - Nested hyperparameter search: for each outer fold, every hyperparameter
+    that needs choosing is selected via an inner, project-grouped,
+    stratified 3-fold cross-validation on that outer fold's training
+    projects only -- the outer test fold is never used for model selection.
+    Candidates are ranked by pooled (micro-averaged) inner-validation PR-AUC:
+    every inner fold's held-out predictions for a given candidate are
+    concatenated into one set before the metric is computed once, rather
+    than averaging metrics computed separately per inner fold. This matters
+    because PR-AUC is rank-based, not additive across folds: with a rare
+    positive class, a per-fold score can be dominated by how few positive
+    examples that one fold happens to contain, and averaging such noisy
+    per-fold scores (macro-averaging) is a biased proxy for how the
+    candidate would perform on a genuinely larger evaluation set. Pooling
+    first (micro-averaging) avoids this.
+  - The decision threshold is likewise selected only from inner-validation
+    predictions (maximizing F1 over a fixed grid), never from the outer test
+    fold.
+  - Once hyperparameters are selected, the winning configuration is refit on
+    the outer fold's entire training partition, and scored exactly once on
+    that fold's held-out test partition.
+  - Headline result: mean and standard deviation of each metric across the 5
+    outer folds. Pooled out-of-fold metrics (every row scored once, by
+    whichever fold's model did not train on it) are reported as a secondary
+    cross-check, together with a 95% confidence interval from a project-
+    block bootstrap (1,000 resamples of whole projects with replacement,
+    percentile method) on the pooled PR-AUC. Cross-experiment differences
+    are assessed via a paired project-block bootstrap over the same pooled
+    predictions.
 
-  [KNOWN LIMITATION, AS BUILT] For Track B's PEFT hyperparameter search (LoRA
-  rank in EXP-4/5/7/8), each rank candidate is evaluated on a SINGLE inner
-  train/validation split per outer fold, not averaged across a full inner
-  K-fold loop the way Track A's alpha/C search and Track B's own linear-probe
-  C search are. This was a deliberate compute-cost tradeoff (each candidate
-  requires a full LoRA training run, unlike a cheap sklearn refit) but was
-  found, after the fact, to produce high-variance rank selection: the
-  identical rank candidate scored PR-AUC=0.070 in one outer fold and
-  PR-AUC=0.548 in another purely due to which held-out split it landed on.
-  Documented here as a methodological limitation of the rank-selection step
-  specifically -- it does not affect the final canonical-model holdout
-  evaluation, which is scored once, on the frozen outer holdout, independent
-  of this search noise.
+6.2 EXPERIMENTAL MATRIX
 
-  [BUG FOUND AND FIXED DURING IMPLEMENTATION] The canonical-retrain step for
-  EXP-4/5/7/8 originally passed the frozen outer holdout directly as the
-  validation set used purely for post-hoc scoring. This was harmless under a
-  fixed training-epoch count, but became a genuine data leak once
-  validation-based early stopping was introduced (Section 7.3): early stopping
-  would have been selecting the "best" epoch using the holdout set meant to be
-  touched exactly once, at final evaluation. Fixed by carving a dedicated
-  internal validation split out of the development partition for early
-  stopping, and scoring the frozen holdout in one separate, single,
-  no-gradient pass afterwards with the selected checkpoint.
+  - CASE STUDY 1: CLASSICAL LEXICAL PIPELINE (feature set: Section 4.4)
+    * EXP-1: Logistic Regression
+      - Word + character TF-IDF (capacity and min_df searched per outer
+        fold) mapped to a class-weighted L2 Logistic Regression (SGD, log
+        loss; L2 strength searched per outer fold).
+    * EXP-2: Shallow MLP
+      - Word + character TF-IDF, reduced via TruncatedSVD, concatenated with
+        the 54-dimension static feature vector, mapped to the MLP specified
+        in Section 5.1. Hyperparameters are searched in two stages per outer
+        fold: first the representation (TF-IDF capacity and SVD component
+        count, architecture held at a default), then the architecture
+        (hidden layer sizes and learning rate, representation fixed at the
+        Stage 1 winner) -- this keeps the joint search space tractable
+        without having to try every representation/architecture combination.
 
-6.2 EXPERIMENTAL MATRIX (AS BUILT):
+  - CASE STUDY 2: NEOBERT PIPELINE
+    * EXP-3: Frozen Backbone Linear Probe
+      - NeoBERT embeddings, frozen, mean-pooled once for the whole dataset;
+        classified via Logistic Regression with the regularization strength
+        (C) searched per outer fold.
+    * EXP-4: LoRA Fine-Tuning
+      - NeoBERT attention projections adapted via LoRA at a fixed rank
+        (Section 5.2). Inner cross-validation is used only to calibrate the
+        decision threshold at this fixed configuration, since rank, alpha,
+        and learning rate are fixed at literature-standard values rather
+        than searched.
 
-  - TRACK A: STANDARD DATA MINING BASELINES (feature set: Section 4.4, "IDABS")
-    * EXP-0 (EXP-0-IDABS): Linear Statistical Baseline
-      - Core Configuration: X_lexical_EXP0 (word+char TF-IDF on abstracted code)
-        mapped to an L2-regularized linear classifier (SGDClassifier, log-loss).
-      - Hyperparameters: alpha selected via nested cross-validation ("Nested
-        Alpha Study"), class_weight='balanced'.
-    * EXP-1 (EXP-1-IDABS): Classical Non-Linear Baseline
-      - Core Configuration: X_lexical_EXP1 (TF-IDF + 54-dim static structural
-        features) mapped to a Random Forest ensemble classifier.
-      - Hyperparameters: n_estimators=300, max_features='sqrt', max_depth=None, 
-        class_weight='balanced_subsample', criterion='gini', random_state=42.
-    * EXP-2 (EXP-2-IDABS): Shallow Deep Learning Baseline
-      - Core Configuration: X_lexical_EXP2 (same combined feature set as EXP-1)
-        mapped to the 3-layer MLP specified in Section 5.1.
-      - Trained with validation-PR-AUC early stopping (patience + min_delta,
-        best-checkpoint restore).
+  Both preprocessing variants (normalized_code and abstracted_code_v1, see
+  Section 4.4) are run through all four experiments and compared side by
+  side, giving 4 experiments x 2 variants = 8 reported runs.
 
-  - TRACK B: ADVANCED TRANSFORMER PIPELINES (2 backbones x 3 methods)
-
-    CodeBERTa-small-v1 backbone:
-    * EXP-3: Frozen Backbone Baseline (Linear Probe)
-      - Core Configuration: CodeBERTa embeddings frozen; mean-pooled
-        representation classified via sklearn LogisticRegression
-        (solver='lbfgs', converges on gradient tolerance -- no early-stopping
-        concerns here).
-      - Hyperparameters: C selected via nested cross-validation grid search.
-    * EXP-4: Coarse PEFT Tracking (LoRA Only)
-      - Core Configuration: CodeBERTa attention projections tuned via LoRA.
-      - Hyperparameters: Rank r ∈ {8, 16}; Alpha = 16; LR = 2e-4; epochs are a
-        CEILING (up to 10), with validation-PR-AUC early stopping (patience=2,
-        min_delta=1e-4, min_epochs=2) -- see Section 7.3 for why this replaced
-        the originally fixed epoch count.
-    * EXP-5: Proposed Structural Pipeline (HEFT: LoRA + ReFT)
-      - Core Configuration: Phase 1 (EXP-4-equivalent LoRA) trained to
-        convergence and frozen; Phase 2 ReFT applied to a single target layer
-        (layer index 4 of 6) at that layer's block output (CodeBERTa uses
-        standard LayerNorm, not Pre-RMSNorm -- see Section 7.2).
-      - Hyperparameters: Intervene rank r_reft=4; LoRA epochs ceiling=10, ReFT
-        epochs ceiling=6, both with independent early stopping (LoRA:
-        patience=2/min_epochs=2; ReFT: patience=2/min_epochs=1, since ReFT was
-        observed to converge much faster than LoRA).
-
-    NeoBERT-250M backbone (mirrors the CodeBERTa track above, method-for-method):
-    * EXP-6: Frozen Backbone Baseline (Linear Probe)
-      - Same protocol as EXP-3, NeoBERT embeddings. Includes an explicit
-        NaN/Inf runtime guardrail on pooled embeddings (Section 5.2, safeguard 1).
-    * EXP-7: Coarse PEFT Tracking (LoRA Only)
-      - Same protocol as EXP-4, NeoBERT backbone; rank grid extended to
-        {8, 16, 32} given NeoBERT's larger hidden capacity.
-    * EXP-8: Proposed Structural Pipeline (HEFT: LoRA + ReFT)
-      - Same protocol as EXP-5, NeoBERT backbone. ReFT layer target defaults to
-        layer 16 of 28 (the PDD's original {12,16,20,24} suggestion, narrowed to
-        a single representative layer for the primary run). Because NeoBERT's
-        actual module tree does not expose a BERT-style "encoder.layer[i].output"
-        submodule (see Section 7.2), the ReFT interception point is resolved
-        dynamically at runtime against the model's real module registry rather
-        than hardcoded, with an explicit pre-flight check before any GPU time is
-        spent on Phase-1 LoRA training.
-
-  [SUPERSEDED] The original design's EXP_5 ("Cross-Model Baseline Validation":
-  ModernBERT-Base run through the identical HEFT pipeline to isolate backbone
-  structural efficiency) was not executed as a third architecture. Its purpose
-  -- isolating how much of the result is attributable to the specific backbone
-  -- is instead served by the CodeBERTa-vs-NeoBERT comparison built into the
-  2x3 matrix above, which was already in scope for practical (compute-budget)
-  reasons and ended up being more informative: it isolates BOTH scale
-  (84M vs 250M) and pretraining domain (code vs. general text) as candidate
-  explanations, rather than a single additional data point.
-
-6.3 RIGOROUS EVALUATION METRICS
-Due to severe class imbalance, accuracy is omitted. Performance optimization is 
-driven by:
-  - Precision: Precision = TP / (TP + FP) [Minimizes False Alarms]
-  - Recall: Recall = TP / (TP + FN) [Minimizes Escaped Vulnerabilities]
-  - F1-Score: F1-Score = (2 × Precision × Recall) / (Precision + Recall)
-  - PR-AUC: Area Under the Precision-Recall Curve (Primary metric optimization target).
-
---------------------------------------------------------------------------------
-7. IMPLEMENTATION ADDENDUM -- DEVIATIONS, FIXES, AND FINDINGS
---------------------------------------------------------------------------------
-This section consolidates, in one place, everything that changed between the
-original architecture specification (Sections 1-6 above, left intact as the
-historical record of what was planned) and the system actually built and
-evaluated. Each subsection is referenced from the section it amends.
-
-7.1 Two-backbone Track B, and the scale-vs-domain finding
-  NeoBERT-250M was the sole originally-planned Track B backbone. CodeBERTa-
-  small-v1 was adopted first for practical compute-budget reasons, with
-  NeoBERT added afterward as planned, once undertraining (Section 7.3) had
-  been ruled out as a confound in the comparison. Result: NeoBERT (250M
-  parameters, zero code exposure in pretraining) underperformed CodeBERTa
-  (84M parameters, code-pretrained but not on C/C++) across the matched
-  LoRA comparison, with the gap statistically significant on the frozen
-  holdout (paired bootstrap CI excluding zero). This is consistent with
-  Result 5 of the original DiverseVul paper (Chen et al., RAID 2023): a
-  60M-parameter code-pretrained model (CodeT5 Small) matched 220M-parameter
-  code-pretrained models, i.e., code-specific pretraining mattered more than
-  raw scale. This project's finding extends that result to PEFT-based
-  fine-tuning (LoRA/HEFT) rather than full fine-tuning, and adds a second data
-  point: some code pretraining (even in the wrong programming languages, as
-  with CodeBERTa's CodeSearchNet corpus) still outperforms zero code
-  pretraining (NeoBERT's pure-text RefinedWeb corpus), regardless of scale.
-
-7.2 ReFT layer targeting is backbone-specific, not a fixed recipe
-  The original design's ReFT positioning ("strictly after NeoBERT's
-  Pre-RMSNorm layers") is architecture-specific to NeoBERT and does not
-  transfer to CodeBERTa, which uses standard LayerNorm and does not have an
-  equivalent "Pre-RMSNorm" concept. Separately, NeoBERT's own module tree (as
-  actually loaded via Hugging Face `trust_remote_code`) does not expose the
-  BERT/RoBERTa-style `encoder.layer[i].output` submodule the original
-  hardcoded ReFT component path assumed -- NeoBERT's encoder stack is a flat
-  `transformer_encoder` module list with no separate post-residual submodule
-  per layer (the residual addition happens inline in each block's forward
-  pass). The as-built pipeline resolves the correct interception point
-  dynamically, by walking the actual (LoRA-wrapped) model's module registry
-  at runtime and locating the target layer's block directly, rather than
-  trusting a hardcoded dotted path -- and fails loudly, before any GPU time is
-  spent on Phase-1 LoRA training, if that resolution doesn't find exactly one
-  match. This is generic across both backbones now (CodeBERTa keeps its
-  original, validated hardcoded path; NeoBERT uses the dynamic resolution).
-
-7.3 Undertraining: diagnosis and fix
-  The three hand-written PyTorch training loops in the original Track B
-  implementation (LoRA for CodeBERTa and NeoBERT, and both phases of HEFT)
-  trained for a fixed, hand-picked number of epochs with no validation
-  checkpointing -- unlike Track A's MLP (which already had proper early
-  stopping) and Track B's own linear-probe experiments (which converge via
-  sklearn's solver tolerance). Per-epoch training-loss logs showed this was a
-  real problem, not a hypothetical one: canonical-retrain loss was still
-  falling steadily at the final fixed epoch in every affected experiment
-  (e.g. NeoBERT LoRA: 1.14 -> 1.02 -> 0.94 -> 0.83 over 4 epochs, no sign of a
-  plateau). Fixed by extracting a single shared early-stopping training loop
-  (case_study_2/training_utils.py), modeled directly on the MLP's existing,
-  working implementation (validation PR-AUC as the primary stopping metric,
-  validation loss as a tie-break within a min_delta tolerance, a patience
-  window, and best-checkpoint restoration), and applying it uniformly to all
-  three affected experiment families. Re-running NeoBERT LoRA with the fix
-  raised its holdout PR-AUC from 0.1081 to 0.1259 -- confirming the diagnosis
-  and meaningfully changing the earlier (undertrained) point estimate.
-  Discovering and fixing this also surfaced the canonical-retrain data-leak
-  risk documented in Section 6.1.
-
-7.4 Track A's actual feature pipeline (see Section 4.4 for the full spec)
-  The original design specified a single TF-IDF-over-n-grams representation
-  for Track A. The as-built "IDABS" pipeline is richer: an identifier-
-  abstraction preprocessing pass (explicitly designed to resist cross-project
-  identifier memorization, which matters given the project-grouped holdout
-  protocol) feeding into word-level TF-IDF, character-level TF-IDF, and (for
-  EXP-1/EXP-2 only) a 54-dimension deterministic structural/security-API
-  feature vector, concatenated via sparse hstack. This was discovered by
-  reading the actual feature-extraction source rather than assumed from the
-  original design text, since the codebase's "IDABS" naming does not
-  self-evidently map to "TF-IDF" as written in Section 4.4 v1.
-
-7.5 Literature comparison caveat
-  The RDiverseVul paper's headline result (LLaMA 3.2, F1=66%) is not a valid
-  direct comparison point for this project's numbers, because it evaluates on
-  a class-balanced (50/50) random-split subsample -- a substantially easier
-  setup than this project's natural class imbalance (~5.6% positive) with a
-  project-grouped, unseen-project holdout. The correct comparison point is the
-  ORIGINAL DiverseVul paper's own "unseen-project" evaluation (same natural
-  imbalance, same project-grouped-holdout philosophy), where the best reported
-  model (CodeT5 Small, full fine-tuning) achieves F1=17.2%. This project's
-  results (F1 in the ~16-18% range at a 0.5 decision threshold, across the
-  Track B matrix) land in the same order of magnitude as that figure, on a
-  materially harder evaluation protocol than RDiverseVul's, and should be
-  discussed against it accordingly in any written report.
-
-7.6 Flagged as future work (not executed in this project)
-  - Increasing Track B's max_sequence_length beyond 512 (up to NeoBERT's
-    native 4,096) to test whether long-context capability recovers anything
-    on the minority of functions truncated at 512 (Section 4.2).
-  - Averaging the LoRA/HEFT rank search over multiple inner splits instead of
-    one, to remove the high-variance rank selection documented in Section 6.1
-    (estimated at roughly 2-3x the current search-phase GPU time, depending on
-    how many inner splits are used).
-  - A true ModernBERT-Base HEFT run, as in the original design's EXP_5, as a
-    third backbone data point beyond the CodeBERTa/NeoBERT comparison.
+6.3 EVALUATION METRICS
+Due to severe class imbalance, accuracy is not used. Performance is reported
+via:
+  - Precision: TP / (TP + FP) -- minimizes false alarms.
+  - Recall: TP / (TP + FN) -- minimizes missed vulnerabilities.
+  - F1-Score: harmonic mean of precision and recall, at the selected
+    decision threshold.
+  - PR-AUC (Average Precision): area under the precision-recall curve;
+    the primary, threshold-independent metric used for model selection and
+    for reporting the headline mean +/- standard deviation result.
 --------------------------------------------------------------------------------
 ================================================================================
