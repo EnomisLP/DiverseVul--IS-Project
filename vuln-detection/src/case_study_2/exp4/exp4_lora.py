@@ -7,11 +7,12 @@ from torch.optim import AdamW
 import numpy as np
 
 from case_study_2.data_loader import create_dataloader, get_class_weights
-from case_study_2.models import get_lora_model, count_trainable_parameters, DEFAULT_CODE_MODEL
+from case_study_2.models import get_lora_model, count_trainable_parameters, DEFAULT_NEOBERT_MODEL
 from case_study_2.training_utils import EarlyStoppingConfig, run_training_with_early_stopping
 
 
 def forward_lora(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Run the model and squeeze a trailing singleton logit dimension."""
     logits = model(input_ids=input_ids, attention_mask=attention_mask)
     if logits.ndim > 1 and logits.size(-1) == 1:
         logits = logits.squeeze(-1)
@@ -23,6 +24,8 @@ def train_lora_model(
     val_df,
     tokenizer,
     rank,
+    lora_alpha=16,
+    learning_rate=2e-4,
     epochs=3,
     batch_size=16,
     grad_accum_steps=2,
@@ -33,27 +36,14 @@ def train_lora_model(
     code_column="normalized_code",
     max_length=512,
     verbose=True,
-    # 500 (not the per-step-friendly 50) because this default is inherited by
-    # the nested rank search and canonical retrain, which each run many
-    # epochs across many folds/candidates -- at 50 that produced hundreds of
-    # near-duplicate "step N/M" lines per run with no added signal beyond the
-    # per-epoch summary line. Interactive/short runs (e.g. the smoke test)
-    # can still pass a smaller value explicitly.
     log_every_steps=500,
     log_prefix="",
-    # --- FIX (see case_study_2/training_utils.py header for full context) --
-    # `epochs` is now a CEILING (max_epochs), not a fixed count: training
-    # stops early once validation PR-AUC stops improving, and the BEST
-    # checkpoint (not necessarily the last) is what gets returned. This
-    # matches the early-stopping convention already used by Track A's MLP
-    # (case_study_1/exp2/exp2_mlp.py) and is consistent with the fact that
-    # EXP-3's linear probe (sklearn lbfgs) already trains to real
-    # convergence rather than a fixed iteration count.
     early_stopping=True,
     patience=2,
     min_delta=1e-4,
     min_epochs=2,
 ):
+    """Fine-tune a LoRA-adapted NeoBERT classifier with validation-PR-AUC early stopping."""
     train_loader = create_dataloader(
         train_df, tokenizer, batch_size=batch_size, max_length=max_length,
         shuffle=True, num_workers=num_workers, code_column=code_column,
@@ -63,7 +53,10 @@ def train_lora_model(
         shuffle=False, num_workers=num_workers, code_column=code_column,
     )
 
-    model = get_lora_model(model_name=DEFAULT_CODE_MODEL, rank=rank, lora_alpha=16).to(device)
+    model = get_lora_model(
+        model_name=DEFAULT_NEOBERT_MODEL, rank=rank, lora_alpha=lora_alpha,
+        trust_remote_code=True,
+    ).to(device)
 
     is_cuda = (device == "cuda") or (hasattr(device, "type") and device.type == "cuda")
     total_steps_per_epoch = -(-len(train_df) // batch_size)
@@ -81,7 +74,7 @@ def train_lora_model(
 
     pos_weight = get_class_weights(train_df).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = AdamW(model.parameters(), lr=2e-4)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
 
     es_config = EarlyStoppingConfig(
         max_epochs=epochs, patience=patience, min_delta=min_delta,
@@ -99,17 +92,12 @@ def train_lora_model(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    return np.array(all_scores), model
+    return np.array(all_scores), model, history
 
 
 def score_model(model, df, tokenizer, device, code_column="normalized_code",
                  max_length=512, batch_size=32, num_workers=2):
-    """
-    Public scoring helper: no-gradient pass over an arbitrary dataframe,
-    deliberately separate from the early-stopping validation loop. Used by
-    run_exp4_canonical_retrain for the single, final pass over the frozen
-    outer holdout (see leakage-guard rationale in exp4_nested_pipeline.py).
-    """
+    """Score an arbitrary dataframe with a trained model: no gradient, no early-stopping bookkeeping."""
     loader = create_dataloader(
         df, tokenizer, batch_size=batch_size, max_length=max_length,
         shuffle=False, num_workers=num_workers, code_column=code_column,
@@ -128,6 +116,7 @@ def score_model(model, df, tokenizer, device, code_column="normalized_code",
 
 
 def train_lora_model_safe(*args, max_retries=2, **kwargs):
+    """Call train_lora_model, halving the batch size and retrying on CUDA OOM."""
     batch_size = kwargs.pop("batch_size", 16)
     grad_accum_steps = kwargs.pop("grad_accum_steps", 2)
 

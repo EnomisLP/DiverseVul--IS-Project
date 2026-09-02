@@ -26,6 +26,7 @@ class NormalizationConfig:
     max_output_size: int = MAX_OUTPUT_SIZE
 
     def __post_init__(self) -> None:
+        """Validate field ranges."""
         if self.max_consecutive_blank_lines < 0:
             raise ValueError("max_consecutive_blank_lines must be >= 0")
         if self.max_input_size <= 0 or self.max_output_size <= 0:
@@ -46,6 +47,7 @@ class Token(NamedTuple):
 
 
 def _coerce_code(value: object, max_size: int = MAX_INPUT_SIZE) -> str:
+    """Coerce a raw value to a size-bounded string, treating null/NaN as empty."""
     if value is None:
         return ""
     try:
@@ -65,20 +67,24 @@ def _coerce_code(value: object, max_size: int = MAX_INPUT_SIZE) -> str:
 
 
 def _normalize_line_endings_and_unicode(code: str) -> str:
+    """Strip a BOM/NUL bytes and normalize line endings to \\n."""
     code = code.lstrip("﻿")
     code = code.replace("\x00", "")
     return code.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _is_ident_start(ch: str) -> bool:
+    """Check whether a character can start a C/C++ identifier."""
     return ch == "_" or ch.isalpha()
 
 
 def _is_ident_continue(ch: str) -> bool:
+    """Check whether a character can continue a C/C++ identifier."""
     return ch == "_" or ch.isalpha() or ch.isdigit()
 
 
 def _scan_identifier(code: str, i: int) -> tuple[str, int]:
+    """Scan one identifier starting at index i."""
     j = i + 1
     while j < len(code) and _is_ident_continue(code[j]):
         j += 1
@@ -86,6 +92,7 @@ def _scan_identifier(code: str, i: int) -> tuple[str, int]:
 
 
 def _scan_line_comment(code: str, i: int) -> tuple[str, int]:
+    """Scan a // line comment starting at index i."""
     j = i
     while j < len(code) and code[j] != "\n":
         j += 1
@@ -95,6 +102,7 @@ def _scan_line_comment(code: str, i: int) -> tuple[str, int]:
 
 
 def _scan_block_comment(code: str, i: int) -> tuple[str, int]:
+    """Scan a /* ... */ block comment starting at index i."""
     j = i + 2
     while j + 1 < len(code):
         if code[j] == "*" and code[j + 1] == "/":
@@ -105,6 +113,7 @@ def _scan_block_comment(code: str, i: int) -> tuple[str, int]:
 
 
 def _scan_ordinary_quoted_literal(code: str, quote_index: int) -> tuple[str, int]:
+    """Scan a quoted string/char literal, honoring backslash escapes."""
     quote = code[quote_index]
     assert quote in {"'", '"'}
     i = quote_index + 1
@@ -123,6 +132,7 @@ def _scan_ordinary_quoted_literal(code: str, quote_index: int) -> tuple[str, int
 
 
 def _scan_prefixed_ordinary_literal(code: str, i: int) -> Optional[tuple[str, int, str]]:
+    """Scan a prefixed string/char literal (u8"...", L'...', etc.), if present at index i."""
     prefixes = ("u8", "u", "U", "L")
     for prefix in prefixes:
         if code.startswith(prefix, i):
@@ -135,6 +145,7 @@ def _scan_prefixed_ordinary_literal(code: str, i: int) -> Optional[tuple[str, in
 
 
 def _scan_raw_string_literal(code: str, i: int) -> Optional[tuple[str, int]]:
+    """Scan a C++11 raw string literal (R"delim(...)delim"), if present at index i."""
     prefixes = ("u8R", "uR", "UR", "LR", "R")
     for prefix in prefixes:
         if not code.startswith(prefix + '"', i):
@@ -157,6 +168,7 @@ def _scan_raw_string_literal(code: str, i: int) -> Optional[tuple[str, int]]:
 
 
 def _scan_number_literal(code: str, i: int) -> tuple[str, int]:
+    """Scan a numeric literal, including hex/exponent/digit-separator characters."""
     n = len(code)
     j = i
 
@@ -183,6 +195,7 @@ MULTI_CHAR_OPERATORS = (
 
 
 def iter_cpp_lexical_tokens(code: str) -> Iterator[Token]:
+    """Tokenize C/C++ source into a stream of lexical Tokens."""
     i = 0
     n = len(code)
     while i < n:
@@ -272,10 +285,12 @@ def iter_cpp_lexical_tokens(code: str) -> Iterator[Token]:
 
 
 def _collapse_whitespace_outside_literals_and_comments(code: str, preserve_comments: bool) -> str:
+    """Collapse runs of horizontal whitespace to a single space, leaving literals/comments untouched."""
     parts: list[str] = []
     pending_space = False
 
     def flush_space() -> None:
+        """Emit at most one pending space before the next token."""
         nonlocal pending_space
         if pending_space and parts and parts[-1] not in {" ", "\n"}:
             parts.append(" ")
@@ -310,6 +325,7 @@ def _collapse_whitespace_outside_literals_and_comments(code: str, preserve_comme
 
 
 def _limit_blank_lines(code: str, max_consecutive_blank_lines: int) -> str:
+    """Trim trailing whitespace per line and cap consecutive blank lines."""
     if max_consecutive_blank_lines < 0:
         raise ValueError("max_consecutive_blank_lines must be >= 0")
     lines = [line.rstrip() for line in code.split("\n")]
@@ -327,6 +343,7 @@ def _limit_blank_lines(code: str, max_consecutive_blank_lines: int) -> str:
 
 
 def normalize_code(code: object, config: NormalizationConfig = DEFAULT_CONFIG) -> str:
+    """Normalize one function's source text (whitespace/blank lines), preserving semantics."""
     normalized = _coerce_code(code, max_size=config.max_input_size)
     if not normalized:
         return ""
@@ -349,6 +366,7 @@ def normalize_code_series(
     codes: Union[pd.Series, Iterable[object]],
     config: NormalizationConfig = DEFAULT_CONFIG,
 ) -> pd.Series:
+    """Apply normalize_code to every element of a series."""
     if not isinstance(codes, pd.Series):
         codes = pd.Series(list(codes))
     return codes.map(lambda value: normalize_code(value, config=config))
@@ -360,6 +378,7 @@ def add_normalized_code_column(
     target_column: str = "normalized_code",
     config: NormalizationConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
+    """Add a normalized-code column derived from an existing source column."""
     if source_column not in frame.columns:
         raise KeyError(f"Missing source column: {source_column}")
     output = frame.copy()
@@ -368,6 +387,7 @@ def add_normalized_code_column(
 
 
 def representation_summary(series: pd.Series) -> dict[str, object]:
+    """Summarize a text column's length distribution and content hash."""
     lengths = series.fillna("").map(len)
     sha = hashlib.sha256("\n".join(series.fillna("").head(10_000).tolist()).encode("utf-8", errors="replace")).hexdigest()
     return {

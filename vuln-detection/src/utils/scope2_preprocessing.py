@@ -31,6 +31,7 @@ _SCOPE2_NOT_FOUND_MARKER = "TreeSitter didn't returned any "
 
 
 def _import_scope2():
+    """Import SCoPE2 and its dependencies, raising a clear install hint if missing."""
     try:
         import tree_sitter_cpp
         from tree_sitter import Language
@@ -49,21 +50,25 @@ def _import_scope2():
 
 
 def build_scope2_processor(query_yaml_text: str):
+    """Build a SCoPE2 processor for the C++ grammar from a tree-sitter query file."""
     SCoPE, Language, tree_sitter_cpp, _, _ = _import_scope2()
     return SCoPE(query_yaml_text, Language(tree_sitter_cpp.language()))
 
 
 def default_transformations() -> List[Type]:
+    """Return the default SCoPE2 transformation set (comments/variables/function names)."""
     _, _, _, _, transformations = _import_scope2()
     return list(transformations)
 
 
 def default_representation_cls():
+    """Return SCoPE2's default code representation class."""
     _, _, _, code_representation_cls, _ = _import_scope2()
     return code_representation_cls
 
 
 def _coerce_code(value: object, max_size: int = MAX_INPUT_SIZE) -> str:
+    """Coerce a raw value to a size-bounded string, treating null/NaN as empty."""
     if value is None:
         return ""
     try:
@@ -83,6 +88,7 @@ def _coerce_code(value: object, max_size: int = MAX_INPUT_SIZE) -> str:
 
 
 def _extract_skip_query_id(warning_message: str) -> str:
+    """Extract the query id from a benign SCoPE2 'transformation had nothing to do' warning."""
     idx = warning_message.find(_SCOPE2_NOT_FOUND_MARKER)
     if idx == -1:
         return warning_message
@@ -90,6 +96,8 @@ def _extract_skip_query_id(warning_message: str) -> str:
 
 
 class Scope2RowResult(NamedTuple):
+    """Outcome of applying SCoPE2 abstraction to one code sample."""
+
     text: str
     failed: bool
     failure_reason: Optional[str]
@@ -103,6 +111,7 @@ def apply_scope2_to_code(
     transformations: Sequence[Type],
     representation_cls: Type,
 ) -> Scope2RowResult:
+    """Apply SCoPE2 abstraction to one code sample, falling back to the input on failure."""
     try:
         text = _coerce_code(code)
     except (TypeError, ValueError) as exc:
@@ -130,6 +139,8 @@ def apply_scope2_to_code(
 
 @dataclass(frozen=True)
 class Scope2BatchReport:
+    """Aggregate outcome of running SCoPE2 abstraction over a batch of rows."""
+
     n_rows: int
     n_empty_input: int
     n_failed: int
@@ -139,6 +150,7 @@ class Scope2BatchReport:
     failed_row_positions: tuple[int, ...]
 
     def summary_lines(self) -> List[str]:
+        """Format this batch report as printable summary lines."""
         lines = [
             f"SCoPE2 batch: {self.n_rows} rows, {self.elapsed_seconds:.1f}s "
             f"({self.n_rows / self.elapsed_seconds if self.elapsed_seconds > 0 else float('inf'):.1f} rows/sec)",
@@ -163,6 +175,7 @@ def apply_scope2_to_series(
     *,
     log_every: int = 25_000,
 ) -> tuple[pd.Series, pd.Series, Scope2BatchReport]:
+    """Apply SCoPE2 abstraction to every element of a series, with progress logging."""
     if transformations is None:
         transformations = default_transformations()
     if representation_cls is None:
@@ -229,6 +242,7 @@ def add_scope2_abstracted_code_column(
     *,
     log_every: int = 25_000,
 ) -> tuple[pd.DataFrame, Scope2BatchReport]:
+    """Add a SCoPE2-abstracted code column (plus a per-row failure flag) to a dataframe."""
     if source_column not in frame.columns:
         raise KeyError(f"Missing source column: {source_column}")
 

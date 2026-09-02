@@ -1,31 +1,12 @@
 """
-Project-aware 5-fold split manifest utilities for Case Study 1, plus a fixed
-80/20 holdout carved out before cross-validation begins.
+Project-grouped, stratified rotating 5-fold split manifest for all experiments.
 
-Reuse contract
---------------
-Every Case Study 1 experiment (CS1-EXP0-LR, CS1-EXP1-RF, CS1-EXP2-MLP) must
-reuse the SAME holdout manifest and the SAME 5-fold CV manifest built on top
-of the dev partition. This guarantees:
-  - identical held-out 20% test set across experiments (for the final,
-    single, post-selection comparison)
-  - identical 5-fold CV splits on the 80% dev partition (for fair model
-    selection)
-
-Two-stage split
-----------------
-1. create_holdout_manifest: StratifiedGroupKFold(n_splits=5), keep ONE fold
-   as holdout (~20%), the rest is dev (~80%). Grouped by project, so no
-   project ever appears in both dev and holdout.
-2. create_project_grouped_manifest: StratifiedGroupKFold(n_splits=5) run
-   AGAIN, but only on the dev partition, to produce the 5 CV folds used for
-   model selection. Grouped by project, so no project ever appears in both
-   train and test of the same fold.
-
-Important:
-----------
-This module prevents project overlap at both levels. It does NOT silently
-remove duplicates or relabel samples.
+Every experiment reuses the SAME manifest: one StratifiedGroupKFold(n_splits=5)
+over the whole dataset, grouped by project, stratified by label. Each row gets
+a fold in {0..4}; there is no separate fixed holdout. Every fold takes a turn
+as the test set (the other 4 are train), and final metrics are the mean and
+standard deviation across the 5 outer folds. This module prevents project
+overlap across folds; it does not silently remove duplicates or relabel samples.
 """
 
 from __future__ import annotations
@@ -42,8 +23,7 @@ import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
 
 
-MANIFEST_VERSION = "cs1-project-grouped-5fold-v1"
-HOLDOUT_MANIFEST_VERSION = "cs1-project-grouped-holdout-v1"
+MANIFEST_VERSION = "project-grouped-rotating-5fold-v2"
 DEFAULT_N_SPLITS = 5
 DEFAULT_RANDOM_STATE = 42
 
@@ -52,22 +32,10 @@ REQUIRED_COLUMNS = ("source_row_id", "label", "project")
 
 @dataclass(frozen=True)
 class SplitConfig:
-    """Configuration used to create the fixed Case Study 1 fold manifest."""
+    """Configuration used to create the rotating fold manifest."""
 
     n_splits: int = DEFAULT_N_SPLITS
     random_state: int = DEFAULT_RANDOM_STATE
-    shuffle: bool = True
-    source_id_column: str = "source_row_id"
-    label_column: str = "label"
-    group_column: str = "project"
-
-
-@dataclass(frozen=True)
-class HoldoutConfig:
-    """Configuration for carving a fixed holdout partition before CV."""
-
-    n_splits_for_holdout: int = 5   # 1/5 -> ~20% holdout
-    random_state: int = 42
     shuffle: bool = True
     source_id_column: str = "source_row_id"
     label_column: str = "label"
@@ -85,6 +53,7 @@ class ManifestPaths:
 
 
 def _require_columns(frame: pd.DataFrame, columns: Iterable[str]) -> None:
+    """Raise a clear error listing any missing required column."""
     missing = [column for column in columns if column not in frame.columns]
     if missing:
         raise KeyError(
@@ -145,8 +114,7 @@ def _prepare_split_frame(
     if not numeric_labels.isin([0, 1]).all():
         observed = sorted(pd.unique(numeric_labels).tolist())
         raise ValueError(
-            "Case Study 1 requires binary labels 0 and 1. "
-            f"Observed label values: {observed[:20]}"
+            f"Requires binary labels 0 and 1. Observed label values: {observed[:20]}"
         )
     split_frame["label"] = numeric_labels.astype("int8")
 
@@ -195,122 +163,11 @@ def dataset_split_fingerprint(
     return sha256(row_hashes.tobytes()).hexdigest()
 
 
-def create_holdout_manifest(
-    frame: pd.DataFrame,
-    config: HoldoutConfig = HoldoutConfig(),
-) -> pd.DataFrame:
-    """
-    Carve a fixed ~20% holdout partition, grouped by project and
-    approximately stratified by label — using the same StratifiedGroupKFold
-    machinery as the 5-fold CV manifest, but keeping only ONE fold aside
-    as holdout and merging the rest into 'dev'.
-
-    Output columns:
-    - source_row_id, label, project
-    - is_holdout: True for the ~20% holdout partition, False for dev
-
-    Must be called BEFORE create_project_grouped_manifest. The 5-fold CV
-    manifest is then built only on the dev subset (is_holdout == False).
-    """
-    split_config = SplitConfig(
-        n_splits=config.n_splits_for_holdout,
-        random_state=config.random_state,
-        shuffle=config.shuffle,
-        source_id_column=config.source_id_column,
-        label_column=config.label_column,
-        group_column=config.group_column,
-    )
-    split_frame = _prepare_split_frame(frame, split_config)
-
-    splitter = StratifiedGroupKFold(
-        n_splits=split_config.n_splits,
-        shuffle=split_config.shuffle,
-        random_state=split_config.random_state if split_config.shuffle else None,
-    )
-
-    dummy_x = np.zeros(shape=(len(split_frame), 1), dtype=np.uint8)
-
-    _, holdout_positions = next(
-        iter(
-            splitter.split(
-                X=dummy_x,
-                y=split_frame["label"].to_numpy(),
-                groups=split_frame["project"].to_numpy(),
-            )
-        )
-    )
-
-    is_holdout = np.zeros(len(split_frame), dtype=bool)
-    is_holdout[holdout_positions] = True
-
-    manifest = split_frame.copy()
-    manifest["is_holdout"] = is_holdout
-
-    holdout_projects = set(manifest.loc[is_holdout, "project"])
-    dev_projects = set(manifest.loc[~is_holdout, "project"])
-    overlap = holdout_projects & dev_projects
-    if overlap:
-        sample = sorted(overlap)[:10]
-        raise RuntimeError(
-            f"Project leakage between holdout and dev. Example overlap: {sample}"
-        )
-
-    for name, mask in (("holdout", is_holdout), ("dev", ~is_holdout)):
-        labels_present = set(manifest.loc[mask, "label"].astype(int).unique().tolist())
-        if labels_present != {0, 1}:
-            raise RuntimeError(
-                f"{name} partition does not contain both classes. "
-                f"Observed labels: {sorted(labels_present)}"
-            )
-
-    return manifest
-
-
-def save_holdout_manifest(
-    manifest: pd.DataFrame,
-    output_dir: Path | str,
-    config: HoldoutConfig = HoldoutConfig(),
-) -> Path:
-    """Save the fixed holdout manifest as a reusable, versioned artifact."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    path = output_dir / "cs1_holdout_manifest.parquet"
-    manifest.sort_values("source_row_id", kind="stable").reset_index(drop=True).to_parquet(
-        path, index=False
-    )
-
-    metadata_path = output_dir / "cs1_holdout_metadata.json"
-    metadata = {
-        "holdout_manifest_version": HOLDOUT_MANIFEST_VERSION,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "config": asdict(config),
-        "rows": int(len(manifest)),
-        "holdout_rows": int(manifest["is_holdout"].sum()),
-        "dev_rows": int((~manifest["is_holdout"]).sum()),
-        "holdout_share": float(manifest["is_holdout"].mean()),
-        "holdout_positive_rate": float(manifest.loc[manifest["is_holdout"], "label"].mean()),
-        "dev_positive_rate": float(manifest.loc[~manifest["is_holdout"], "label"].mean()),
-        "unique_projects": int(manifest["project"].nunique()),
-        "holdout_unique_projects": int(manifest.loc[manifest["is_holdout"], "project"].nunique()),
-        "dev_unique_projects": int(manifest.loc[~manifest["is_holdout"], "project"].nunique()),
-    }
-    with metadata_path.open("w", encoding="utf-8") as file:
-        json.dump(metadata, file, indent=2)
-
-    return path
-
-
 def create_project_grouped_manifest(
     frame: pd.DataFrame,
     config: SplitConfig = SplitConfig(),
 ) -> pd.DataFrame:
-    """
-    Create a fixed test-fold assignment with StratifiedGroupKFold.
-
-    Output columns:
-    - source_row_id, label, project, fold (test-fold assignment in [0, n_splits-1])
-    """
+    """Assign every row to one of n_splits rotating test folds via StratifiedGroupKFold."""
     split_frame = _prepare_split_frame(frame, config)
 
     splitter = StratifiedGroupKFold(
@@ -395,7 +252,7 @@ def assert_manifest_integrity(
     manifest: pd.DataFrame,
     config: SplitConfig = SplitConfig(),
 ) -> None:
-    """Raise an error if a manifest violates the Case Study 1 split rules."""
+    """Raise an error if a manifest violates the project-grouped split rules."""
     _require_columns(manifest, ("source_row_id", "label", "project", "fold"))
 
     if manifest.empty:
@@ -458,7 +315,7 @@ def save_manifest_artifacts(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = f"cs1_project_grouped_{config.n_splits}fold"
+    stem = f"project_grouped_{config.n_splits}fold"
     csv_path = output_dir / f"{stem}_manifest.csv"
     parquet_path = output_dir / f"{stem}_manifest.parquet"
     summary_path = output_dir / f"{stem}_fold_summary.csv"
@@ -537,7 +394,7 @@ def apply_manifest(
     manifest: pd.DataFrame,
     source_id_column: str = "source_row_id",
 ) -> pd.DataFrame:
-    """Attach the fixed fold assignment to a Case Study 1 dataframe."""
+    """Attach the fold assignment to a dataframe by merging on source_row_id."""
     _require_columns(frame, (source_id_column,))
     _require_columns(manifest, ("source_row_id", "fold", "label", "project"))
 
@@ -593,15 +450,11 @@ __all__ = [
     "DEFAULT_N_SPLITS",
     "DEFAULT_RANDOM_STATE",
     "MANIFEST_VERSION",
-    "HOLDOUT_MANIFEST_VERSION",
     "ManifestPaths",
     "SplitConfig",
-    "HoldoutConfig",
     "apply_manifest",
     "assert_manifest_integrity",
     "create_project_grouped_manifest",
-    "create_holdout_manifest",
-    "save_holdout_manifest",
     "dataset_split_fingerprint",
     "load_manifest",
     "save_manifest_artifacts",

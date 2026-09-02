@@ -1,16 +1,8 @@
 """
-Reusable evaluation utilities for Case Study 1.
+Reusable evaluation utilities shared by every experiment (CS1-EXP1, CS1-EXP2, CS2-EXP3, CS2-EXP4).
 
-This module evaluates out-of-fold (OOF) binary vulnerability predictions from
-any Case Study 1 experiment:
-
-    CS1-EXP0-LR
-    CS1-EXP1-RF
-    CS1-EXP2-MLP
-
-Expected prediction schema
---------------------------
-At minimum, the input prediction DataFrame must contain:
+Evaluates out-of-fold (OOF) binary vulnerability predictions collected across
+the 5 rotating outer folds. Expected prediction schema:
 
     source_row_id : immutable ID from the canonical dataset
     fold          : held-out test fold ID
@@ -22,14 +14,13 @@ exports. The evaluator creates ``y_pred`` using the configured threshold.
 
 Important methodological rule
 -----------------------------
-The outer test predictions must NOT be used to choose a "best" threshold.
-This module can produce threshold tables for descriptive analysis, but EXP-0
-uses the pre-declared baseline threshold 0.50. Any threshold optimization in a
-later experiment must happen only inside the corresponding training fold.
+Outer test predictions must NOT be used to choose a threshold; every
+experiment selects its decision threshold from inner-CV validation scores
+only (see ``select_f1_threshold``), never from the outer test fold.
 
-The primary result is the pooled OOF evaluation: every dataset sample is
-predicted once by a model that did not train on that sample's project.
-Fold-level metrics are secondary stability diagnostics.
+Headline result: mean and standard deviation of each metric across the 5
+outer folds (``summarize_fold_metrics``). The pooled-OOF numbers are kept as
+a secondary, single-number cross-check.
 """
 
 from __future__ import annotations
@@ -105,6 +96,7 @@ def _json_default(value: object) -> object:
 
 
 def _require_columns(frame: pd.DataFrame, columns: Iterable[str]) -> None:
+    """Raise a clear error listing any missing required column."""
     missing = [column for column in columns if column not in frame.columns]
     if missing:
         raise KeyError(
@@ -114,6 +106,7 @@ def _require_columns(frame: pd.DataFrame, columns: Iterable[str]) -> None:
 
 
 def _validate_threshold(threshold: float) -> float:
+    """Validate that a threshold lies strictly between 0 and 1."""
     threshold = float(threshold)
     if not 0.0 < threshold < 1.0:
         raise ValueError(
@@ -200,6 +193,7 @@ def _binary_predictions(scores: Sequence[float], threshold: float) -> np.ndarray
 
 
 def _safe_divide(numerator: int | float, denominator: int | float) -> float:
+    """Divide, returning 0.0 instead of raising on a zero denominator."""
     return float(numerator / denominator) if denominator else 0.0
 
 
@@ -269,6 +263,35 @@ def compute_binary_metrics(
         "predicted_positive": int(y_pred.sum()),
         "predicted_positive_rate": float(y_pred.mean()),
     }
+
+
+DEFAULT_VALIDATION_THRESHOLD_GRID = tuple(np.round(np.arange(0.01, 0.99 + 1e-9, 0.01), 2).tolist())
+
+
+def select_f1_threshold(
+    labels: Sequence[int],
+    scores: Sequence[float],
+    threshold_grid: Sequence[float] = DEFAULT_VALIDATION_THRESHOLD_GRID,
+) -> tuple[float, dict]:
+    """Select the F1-maximizing threshold from validation-only scores; ties broken by precision, then fewer alerts."""
+    best: Optional[tuple[tuple[float, float, int], dict]] = None
+    for threshold in threshold_grid:
+        metrics = compute_binary_metrics(labels=labels, scores=scores, threshold=float(threshold))
+        key = (metrics["f1"], metrics["precision"], -metrics["predicted_positive"])
+        if best is None or key > best[0]:
+            best = (key, metrics)
+
+    assert best is not None
+    selected = dict(best[1])
+    selected["selection_objective"] = "f1"
+    selected["candidate_count"] = int(len(threshold_grid))
+    selected["candidate_min"] = float(min(threshold_grid))
+    selected["candidate_max"] = float(max(threshold_grid))
+    selected["selected_at_grid_boundary"] = bool(
+        np.isclose(selected["threshold"], selected["candidate_min"])
+        or np.isclose(selected["threshold"], selected["candidate_max"])
+    )
+    return float(selected["threshold"]), selected
 
 
 def build_threshold_metrics(
@@ -653,6 +676,7 @@ def format_metric_report(pooled_metrics: Mapping[str, object]) -> str:
 
 __all__ = [
     "DEFAULT_THRESHOLD_GRID",
+    "DEFAULT_VALIDATION_THRESHOLD_GRID",
     "EVALUATION_VERSION",
     "EvaluationConfig",
     "EvaluationPaths",
@@ -663,5 +687,6 @@ __all__ = [
     "plot_confusion_matrix",
     "plot_precision_recall_curve",
     "save_evaluation_artifacts",
+    "select_f1_threshold",
     "summarize_fold_metrics",
 ]

@@ -1,4 +1,4 @@
-"""Lightweight deterministic C/C++ structural feature extraction for CS1-EXP1.
+"""Lightweight deterministic C/C++ structural feature extraction for CS1-EXP2.
 
 The features in this module are source-level proxies, not compiler-verified
 semantic static analysis. Comment and literal contents are excluded from code
@@ -84,10 +84,12 @@ class StaticFeatureConfig:
 
 
 def _count_word(tokens: Sequence[str], token: str) -> int:
+    """Count exact occurrences of one token."""
     return int(sum(item == token for item in tokens))
 
 
 def _count_api_calls(function_names: Sequence[str], api_names: set[str]) -> int:
+    """Count calls whose function name is in the given API set."""
     return int(sum(name in api_names for name in function_names))
 
 

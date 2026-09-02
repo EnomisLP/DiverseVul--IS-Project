@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
-import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -13,6 +12,8 @@ EMPTY_CODE_SENTINEL = "EMPTY_CODE_SAMPLE"
 
 
 class CodeTextDataset(Dataset):
+    """PyTorch Dataset yielding raw code text plus label/id/project for one row."""
+
     def __init__(
         self,
         dataframe: pd.DataFrame,
@@ -21,6 +22,7 @@ class CodeTextDataset(Dataset):
         source_id_column: str = "source_row_id",
         project_column: str = "project",
     ) -> None:
+        """Copy the frame and replace empty code with a sentinel token."""
         self.df = dataframe.copy().reset_index(drop=True)
         self.code_column = code_column
         self.label_column = label_column
@@ -33,9 +35,11 @@ class CodeTextDataset(Dataset):
             self.df.loc[empty_mask, self.code_column] = EMPTY_CODE_SENTINEL
 
     def __len__(self) -> int:
+        """Return the number of rows."""
         return int(len(self.df))
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Return one row as a plain dict."""
         row = self.df.iloc[idx]
         return {
             "code": str(row[self.code_column]),
@@ -47,11 +51,14 @@ class CodeTextDataset(Dataset):
 
 @dataclass
 class TransformerBatchCollator:
+    """Tokenize a batch of raw-code dicts into padded model inputs."""
+
     tokenizer: Any
     max_length: int = 512
     pad_to_multiple_of: Optional[int] = 8
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Tokenize and collate a list of row dicts into one batch."""
         texts = [feature["code"] for feature in features]
         enc = self.tokenizer(
             texts,
@@ -85,6 +92,7 @@ def create_dataloader(
     project_column: str = "project",
     num_workers: int = 0,
 ) -> DataLoader:
+    """Build a DataLoader that tokenizes code rows on the fly."""
     dataset = CodeTextDataset(
         dataframe=dataframe,
         code_column=code_column,
@@ -109,6 +117,7 @@ def create_dataloader(
 
 
 def get_pos_weight(dataframe: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
+    """Compute the negative/positive ratio for BCEWithLogitsLoss's pos_weight."""
     y = dataframe[label_column].astype(int).values
     neg = int((y == 0).sum())
     pos = int((y == 1).sum())
@@ -118,77 +127,6 @@ def get_pos_weight(dataframe: pd.DataFrame, label_column: str = "label") -> torc
 
 
 def get_class_weights(dataframe: pd.DataFrame, label_column: str = "label") -> torch.Tensor:
+    """Alias for get_pos_weight, used as the BCE positive-class weight."""
     return get_pos_weight(dataframe, label_column=label_column)
 
-
-def sample_with_optional_positive_fraction(
-    frame: pd.DataFrame,
-    n_rows: int,
-    label_column: str = "label",
-    positive_fraction: Optional[float] = None,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    if n_rows is None or n_rows <= 0 or len(frame) <= n_rows:
-        return frame.copy().reset_index(drop=True)
-
-    rng = np.random.default_rng(random_state)
-
-    if positive_fraction is None:
-        indices = rng.choice(frame.index.to_numpy(), size=n_rows, replace=False)
-        return frame.loc[indices].copy().reset_index(drop=True)
-
-    positives = frame[frame[label_column].astype(int) == 1]
-    negatives = frame[frame[label_column].astype(int) == 0]
-
-    n_pos = min(len(positives), max(1, int(round(n_rows * positive_fraction))))
-    n_neg = min(len(negatives), n_rows - n_pos)
-
-    pos_idx = rng.choice(positives.index.to_numpy(), size=n_pos, replace=False) if n_pos else []
-    neg_idx = rng.choice(negatives.index.to_numpy(), size=n_neg, replace=False) if n_neg else []
-    idx = np.concatenate([pos_idx, neg_idx])
-    rng.shuffle(idx)
-
-    return frame.loc[idx].copy().reset_index(drop=True)
-
-
-def make_project_disjoint_threshold_split(
-    train_frame: pd.DataFrame,
-    threshold_fraction: float = 0.20,
-    project_column: str = "project",
-    label_column: str = "label",
-    random_state: int = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    projects = train_frame[[project_column, label_column]].groupby(project_column)[label_column].agg(["count", "sum"])
-    project_names = projects.index.to_numpy()
-
-    rng = np.random.default_rng(random_state)
-    shuffled = project_names.copy()
-    rng.shuffle(shuffled)
-
-    target_rows = int(round(len(train_frame) * threshold_fraction))
-    selected = []
-    count = 0
-
-    for project in shuffled:
-        selected.append(project)
-        count += int(projects.loc[project, "count"])
-        if count >= target_rows:
-            break
-
-    selected = set(selected)
-    threshold_mask = train_frame[project_column].isin(selected)
-    threshold_frame = train_frame[threshold_mask].copy().reset_index(drop=True)
-    fit_frame = train_frame[~threshold_mask].copy().reset_index(drop=True)
-
-    if (
-        fit_frame[label_column].sum() == 0
-        or threshold_frame[label_column].sum() == 0
-        or len(fit_frame) == 0
-        or len(threshold_frame) == 0
-    ):
-        shuffled_rows = train_frame.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
-        cut = max(1, int(round(len(shuffled_rows) * (1.0 - threshold_fraction))))
-        fit_frame = shuffled_rows.iloc[:cut].copy().reset_index(drop=True)
-        threshold_frame = shuffled_rows.iloc[cut:].copy().reset_index(drop=True)
-
-    return fit_frame, threshold_frame

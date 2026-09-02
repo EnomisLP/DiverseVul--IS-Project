@@ -14,29 +14,22 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 DEFAULT_CODE_MODEL = "huggingface/CodeBERTa-small-v1"
 DEFAULT_CODE_TOKENIZER = "huggingface/CodeBERTa-small-v1"
 
-# EXP-7: NeoBERT-250M backbone (Chandar Research Lab). Plug-and-play replacement
-# for the CodeBERTa backbone above -- same hidden size (768), but a 4,096-token
-# RoPE/YaRE context window, SwiGLU activations, and Pre-RMSNorm. Ships as
-# `trust_remote_code` model code on the Hub rather than a native `transformers`
-# architecture, so it needs a couple of extra loading safeguards (see
-# `_neobert_loading_overrides` below).
+# NeoBERT-250M backbone (Chandar Research Lab); ships as trust_remote_code on the Hub.
 DEFAULT_NEOBERT_MODEL = "chandar-lab/NeoBERT"
 DEFAULT_NEOBERT_TOKENIZER = "chandar-lab/NeoBERT"
 
-# Model-name substrings that identify a NeoBERT-family checkpoint and therefore
-# require `trust_remote_code=True` plus the safeguards below. Kept as a simple
-# substring match (rather than a fixed set) so forks/finetunes of NeoBERT
-# (e.g. "chandar-lab/NeoBERT", "someuser/NeoBERT-finetuned-...") are still
-# picked up automatically.
+# Substring match so NeoBERT forks/finetunes are still recognized.
 _NEOBERT_NAME_HINTS = ("neobert",)
 
 
 def _is_neobert_model(model_name: str) -> bool:
+    """Check whether a model name refers to a NeoBERT-family checkpoint."""
     name = (model_name or "").lower()
     return any(hint in name for hint in _NEOBERT_NAME_HINTS)
 
 
 def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
+    """Set the Hugging Face cache/env variables used across this project's downloads."""
     if hf_cache_dir:
         hf_cache_dir = str(hf_cache_dir)
         os.environ.setdefault("HF_HOME", hf_cache_dir)
@@ -49,6 +42,7 @@ def configure_huggingface_cache(hf_cache_dir: Optional[str] = None) -> None:
 
 
 def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
+    """Resolve a torch dtype from a policy name and device."""
     dtype_policy = (dtype_policy or "auto").lower()
     device = str(device)
     if dtype_policy == "float16":
@@ -67,20 +61,7 @@ def _dtype_from_policy(dtype_policy: str, device: str) -> Optional[torch.dtype]:
 
 
 def _apply_neobert_config_overrides(config: Any) -> Any:
-    """
-    Mandatory Track-B safeguard (PDD sec. 5.2, GitHub Issue #7 on
-    chandar-lab/NeoBERT -- "How is unpadding handled when unpacking?"):
-    sequence-packing / unpadding in the reference NeoBERT code can leak
-    attention across the pad boundary when the collator doesn't also emit
-    packed cu_seqlens, which is exactly our setup (we pad batches instead of
-    packing them). Forcing `use_unpadding=False` makes NeoBERT fall back to
-    strict padded multi-head attention with the HF attention mask, which is
-    the safe/correct path for this pipeline.
-
-    The exact attribute name has moved around across NeoBERT code revisions,
-    so we try the known aliases and only set whichever is actually present on
-    this revision's config, rather than hard-failing.
-    """
+    """Disable NeoBERT sequence unpadding, since we pad batches instead of packing them."""
     candidate_flags = ("use_unpadding", "unpad_inputs", "unpad", "pack_sequences")
     matched = False
     for flag in candidate_flags:
@@ -89,10 +70,8 @@ def _apply_neobert_config_overrides(config: Any) -> Any:
             matched = True
     if not matched:
         warnings.warn(
-            "[models] Could not find a known unpadding flag on the NeoBERT config "
-            "(checked: %s). This revision of chandar-lab/NeoBERT may handle "
-            "padding differently -- double check attention-mask correctness "
-            "manually (see PDD sec. 5.2 / GitHub Issue #7)." % (candidate_flags,)
+            "[models] No known unpadding flag found on the NeoBERT config "
+            f"(checked: {candidate_flags}); verify attention-mask correctness manually."
         )
     return config
 
@@ -102,6 +81,7 @@ def load_code_tokenizer(
     hf_cache_dir: Optional[str] = None,
     trust_remote_code: Optional[bool] = None,
 ):
+    """Load the tokenizer for a code model, auto-detecting NeoBERT's trust_remote_code need."""
     configure_huggingface_cache(hf_cache_dir)
     if trust_remote_code is None:
         trust_remote_code = _is_neobert_model(tokenizer_name)
@@ -121,6 +101,7 @@ def load_code_encoder(
     hf_cache_dir: Optional[str] = None,
     trust_remote_code: Optional[bool] = None,
 ) -> nn.Module:
+    """Load a code backbone encoder, applying NeoBERT-specific safeguards when needed."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     configure_huggingface_cache(hf_cache_dir)
     dtype = _dtype_from_policy(dtype_policy, device)
@@ -134,31 +115,14 @@ def load_code_encoder(
         kwargs["torch_dtype"] = dtype
 
     if is_neobert:
-        # Mandatory Track-B safeguard (found via device-side CUDA assert
-        # while running EXP-8's official nested rank search at real batch
-        # sizes -- never surfaced on the tiny smoke-test sample). PyTorch's
-        # OWN native torch.nn.functional.scaled_dot_product_attention (NOT
-        # the separate flash-attn PyPI package this project deliberately
-        # does not install) auto-selects among its own flash / memory-
-        # efficient / math backends based on hardware+dtype heuristics.
-        # NeoBERT's remote modeling code calls this function directly with a
-        # boolean attention mask in its padded "fall back to SDPA" branch --
-        # the same safe, non-packed path use_unpadding=False below is meant
-        # to guarantee -- but on this environment (torch 2.5.1+cu121 / A100)
-        # the fused flash/memory-efficient backends crashed with
-        # "RuntimeError: CUDA error: device-side assert triggered" on real
-        # (non-toy) batches. Forcing the math (reference, unfused) backend
-        # trades some speed for guaranteed-correct attention on masked,
-        # variable-length batches, consistent with this project's existing
-        # preference for correctness over speed in NeoBERT's attention path.
+        # NeoBERT's fused flash/memory-efficient SDPA backends crash with a
+        # device-side CUDA assert on real (non-toy) batches on this
+        # environment; force the math (unfused) backend instead.
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
 
-        # Load + patch the config explicitly (rather than relying on
-        # AutoModel.from_pretrained's implicit config loading) so the
-        # unpadding override in _apply_neobert_config_overrides is guaranteed
-        # to be in effect before the backbone is instantiated.
+        # Patch the config before the backbone is instantiated.
         config = AutoConfig.from_pretrained(
             model_name, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code
         )
@@ -177,6 +141,7 @@ def load_code_encoder(
 
 
 def mean_pool_last_hidden(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mean-pool token embeddings over non-padded positions."""
     mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
     summed = (last_hidden_state * mask).sum(dim=1)
     denom = mask.sum(dim=1).clamp(min=1.0)
@@ -184,10 +149,13 @@ def mean_pool_last_hidden(last_hidden_state: torch.Tensor, attention_mask: torch
 
 
 def cls_pool_last_hidden(last_hidden_state: torch.Tensor) -> torch.Tensor:
+    """Take the [CLS]-position embedding."""
     return last_hidden_state[:, 0, :]
 
 
 class CodeSequenceClassifier(nn.Module):
+    """Backbone encoder + linear classification head over pooled embeddings."""
+
     def __init__(
         self,
         model_name: str = DEFAULT_CODE_MODEL,
@@ -199,6 +167,7 @@ class CodeSequenceClassifier(nn.Module):
         trust_remote_code: Optional[bool] = None,
         enforce_fp32_head: Optional[bool] = None,
     ) -> None:
+        """Build the backbone and classification head."""
         super().__init__()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.backbone = load_code_encoder(
@@ -213,29 +182,25 @@ class CodeSequenceClassifier(nn.Module):
         self.classification_head = nn.Linear(hidden_size, num_labels)
         self.pooling = pooling
 
-        # Mandatory Track-B safeguard (PDD sec. 5.2, GitHub Issue #11 on
-        # chandar-lab/NeoBERT -- NaN training bug): pooling + the
-        # classification head are forced to run in explicit float32,
-        # regardless of the ambient autocast dtype, so a bf16/fp16 NaN/Inf
-        # produced upstream in NeoBERT's attention stack doesn't get baked
-        # into the (trainable) head via a half-precision matmul. This is a
-        # wrapper-level mitigation -- it doesn't patch NeoBERT's own remote
-        # code, it just keeps *our* downstream math numerically safe.
+        # Pooling and the classification head run in float32 regardless of
+        # ambient autocast dtype, to avoid baking a bf16/fp16 NaN/Inf from
+        # NeoBERT's attention stack into the trainable head.
         if enforce_fp32_head is None:
             enforce_fp32_head = _is_neobert_model(model_name)
         self.enforce_fp32_head = enforce_fp32_head
 
     @property
     def config(self):
-        """Expose the underlying backbone config to pyreft/peft."""
+        """Expose the underlying backbone config to peft."""
         return self.backbone.config
 
     @property
     def device(self) -> torch.device:
-        """Expose the device where parameters reside for pyreft."""
+        """Expose the device where parameters reside."""
         return next(self.parameters()).device
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Encode, pool, and classify a batch, returning logits."""
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden = outputs.last_hidden_state
 
@@ -251,9 +216,7 @@ class CodeSequenceClassifier(nn.Module):
             pooled = mean_pool_last_hidden(hidden, attention_mask_for_pool)
 
         if self.enforce_fp32_head:
-            # Disable autocast for the head matmul so it isn't silently
-            # downcast back to bf16/fp16 by the enclosing `torch.amp.autocast`
-            # context in the training loop.
+            # Disable autocast so the head matmul isn't downcast back to bf16/fp16.
             with torch.autocast(device_type=pooled.device.type, enabled=False):
                 logits = self.classification_head(pooled.float())
         else:
@@ -265,6 +228,7 @@ class CodeSequenceClassifier(nn.Module):
 
 
 def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
+    """Report trainable vs. total parameter counts."""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return {
@@ -275,6 +239,7 @@ def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
 
 
 def infer_lora_target_modules(model: nn.Module) -> List[str]:
+    """Guess which attention projection module names LoRA should target."""
     module_names = [name for name, _ in model.named_modules()]
     candidate_sets = [
         ["qkv"],
@@ -298,6 +263,7 @@ def create_lora_sequence_classifier(
     hf_cache_dir: Optional[str] = None,
     trust_remote_code: Optional[bool] = None,
 ):
+    """Wrap a CodeSequenceClassifier with a LoRA adapter via peft."""
     from peft import LoraConfig, get_peft_model
 
     base = CodeSequenceClassifier(
@@ -328,6 +294,7 @@ def get_lora_model(
     pooling: str = "mean",
     trust_remote_code: Optional[bool] = None,
 ):
+    """Build a LoRA-adapted sequence classifier for the given backbone."""
     return create_lora_sequence_classifier(
         model_name=model_name,
         rank=rank,
@@ -336,203 +303,3 @@ def get_lora_model(
         trust_remote_code=trust_remote_code,
     )
 
-
-# =====================================================================
-# EXP-5: HEFT (Hierarchical Efficient Fine-Tuning: LoRA -> freeze -> ReFT)
-# =====================================================================
-#
-# HEFT is a two-phase procedure:
-#   Phase 1 (LoRA): train a standard LoRA-adapted sequence classifier
-#                    (use get_lora_model() below, already defined above).
-#   Phase 2 (ReFT):  freeze *everything* learned in Phase 1 (LoRA adapters,
-#                    classification head, backbone) and train a LoReFT
-#                    intervention on top of the frozen, LoRA-adapted backbone
-#                    (use attach_reft_to_lora_model() below).
-#
-# These two builders are meant to be driven by the two-phase training loop in
-# exp5_heft.py -- they only construct models, they don't train anything.
-
-def freeze_lora_parameters(model: nn.Module) -> None:
-    """Freezes LoRA adapter parameters learned in Phase 1."""
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            param.requires_grad = False
-
-
-def reft_component_path(layer_target: int) -> str:
-    """
-    Dotted/bracket component path pyreft needs to locate the target layer's
-    output *inside a peft-wrapped model*.
-
-    peft.get_peft_model() re-nests the original module tree under
-    "base_model.model.*" rather than preserving the original top-level
-    attribute names. pyreft/pyvene resolve `component` strings via
-    nn.Module.get_submodule(), which walks the *real* module registry (not
-    Python attribute-forwarding), so a path like
-    "backbone.encoder.layer[i].output" -- valid on the bare, unwrapped model --
-    does not exist once the model has been wrapped with LoRA, and pyreft will
-    fail to find it. It must be prefixed with "base_model.model." to match the
-    wrapped model's actual module tree. (This mirrors the pattern pyreft's own
-    docs use for peft-wrapped causal LMs: "base_model.model.model.layers[i]...".)
-
-    NOTE: this hardcoded path assumes a BERT/RoBERTa-style module tree
-    (`encoder.layer[i].output`), which is what CodeBERTa (EXP-5) has. It does
-    NOT apply to NeoBERT (EXP-8) -- see resolve_reft_component_path below,
-    which is architecture-aware and used for both.
-    """
-    return f"base_model.model.backbone.encoder.layer[{layer_target}].output"
-
-
-def resolve_reft_component_path(lora_model: nn.Module, layer_target: int, model_name: str) -> str:
-    """
-    Architecture-aware version of reft_component_path, used by
-    attach_reft_to_lora_model for both EXP-5 (CodeBERTa) and EXP-8 (NeoBERT).
-
-    CodeBERTa is a standard BERT/RoBERTa-style module tree
-    (`encoder.layer[i].output` per layer -- a dedicated submodule whose output
-    IS the post-residual hidden state), so the hardcoded reft_component_path
-    above is safe and is used as-is for backward compatibility with EXP-5.
-
-    NeoBERT's module tree is different and NOT part of the public
-    `transformers` library (it's loaded via `trust_remote_code`, and the
-    Hugging Face Hub copy of its modeling code is not pinned/inspectable
-    ahead of time the way a released `transformers` architecture is): its
-    encoder stack is `transformer_encoder` (an nn.ModuleList of
-    `EncoderBlock`s), and each block has no separate "output" submodule --
-    the residual add happens inline in EncoderBlock.forward(), so the block
-    itself (whose forward() return value IS the post-residual hidden state)
-    is the right interception point, not some child of it.
-
-    Rather than hardcode a guessed dotted path for NeoBERT (wrong by even one
-    level of nesting and pyreft fails after Phase-1 LoRA has already finished
-    training -- an expensive way to find out), this WALKS the model's actual
-    module registry via named_modules() and finds whichever module path ends
-    in "transformer_encoder.<layer_target>", so it's correct regardless of
-    exactly how many wrapper levels (peft's "base_model.model.", our own
-    "backbone.", NeoBERT's own internal "model." prefix, etc.) sit above it.
-    Raises immediately with a clear message (before any Phase-2 training
-    starts) if no matching module is found, rather than letting pyreft fail
-    with a more cryptic KeyError deeper inside get_reft_model().
-
-    --- FIX (trailing ".output" is required, and it is NOT a real submodule)
-    The walked path above resolves to the *block itself*
-    ("...transformer_encoder.<layer_target>", an EncoderBlock instance) --
-    that part is correct per the reasoning above. But pyreft/pyvene's
-    `component` string is not just "which module" -- the trailing token
-    ("output"/"input"/etc, after the final ".") is a SEPARATE piece of
-    information pyvene's get_module_hook() parses off the string to decide
-    *which hook type* to register (register_forward_hook to capture the
-    module's return value vs. register_forward_pre_hook to capture its
-    input). Without a trailing type token pyvene never determines a hook
-    type at all, and the very next line that reads it
-    (`getattr(module, hook_type)`) raises `UnboundLocalError: local variable
-    'hook_type' referenced before assignment` -- which is exactly the error
-    this fix resolves; it also matches the crash signature seen in the
-    EXP-8 smoke test (Cell 11), which failed inside
-    attach_reft_to_lora_model() -> pyreft.get_reft_model() with that same
-    UnboundLocalError.
-
-    Crucially, ".output" here is a *symbolic* suffix, not a literal
-    attribute lookup -- pyreft's own README uses the identical convention
-    for peft-wrapped Llama decoder layers
-    (`f"base_model.model.model.layers[{l}].output"`), and
-    `LlamaDecoderLayer` has no literal `.output` submodule either. pyvene
-    strips the suffix before resolving the real module via
-    getattr_for_torch_module() on the *prefix*, so appending ".output" is
-    correct and safe even though EncoderBlock (like LlamaDecoderLayer) has
-    no submodule actually named "output" -- it tells pyvene "hook this
-    module's forward-pass return value", which is exactly the
-    post-residual hidden state we want per the reasoning above.
-
-    NOTE: because ".output" here is symbolic, `model.get_submodule(path)`
-    will NOT resolve on the string this function returns -- if you want to
-    sanity-check the path against the real module tree (as Section 10 of
-    the EXP-8 notebook does), strip the trailing ".output"/".input" first,
-    e.g. `path.rsplit(".", 1)[0]`.
-    """
-    if not _is_neobert_model(model_name):
-        return reft_component_path(layer_target)
-
-    suffix = f"transformer_encoder.{layer_target}"
-    matches = [name for name, _ in lora_model.named_modules() if name.endswith(suffix)]
-
-    if not matches:
-        available = sorted(
-            {name for name, _ in lora_model.named_modules() if "transformer_encoder" in name}
-        )
-        raise RuntimeError(
-            f"[reft] Could not find a module path ending in '{suffix}' in the "
-            f"LoRA-wrapped NeoBERT model's module tree (needed for EXP-8's ReFT phase). "
-            f"NeoBERT's Hub modeling code may have changed since this was written. "
-            f"Module paths containing 'transformer_encoder' that WERE found: "
-            f"{available[:20]}{'...' if len(available) > 20 else ''}. "
-            f"Update resolve_reft_component_path in models.py to match the current structure."
-        )
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"[reft] Ambiguous: found {len(matches)} module paths ending in '{suffix}' "
-            f"({matches}) -- expected exactly one. Refusing to guess which one is correct."
-        )
-    # ".output" is a symbolic suffix pyvene/pyreft parse off the component
-    # string to pick a hook type (forward hook on the module's return value)
-    # -- see the FIX note in this function's docstring. It does NOT need to
-    # (and for NeoBERT's EncoderBlock, does not) correspond to a real
-    # submodule attribute.
-    return matches[0] + ".output"
-
-
-def attach_reft_to_lora_model(
-    lora_model: nn.Module,
-    reft_rank: int = 4,
-    layer_target: int = 4,
-    freeze_previous_phase: bool = True,
-    model_name: str = DEFAULT_CODE_MODEL,
-):
-    """
-    HEFT Phase 2. Takes an already Phase-1-trained LoRA model (as returned by
-    get_lora_model / create_lora_sequence_classifier) and attaches a LoReFT
-    intervention on top of it.
-
-    `model_name` is used only to pick the right component-path resolution
-    strategy (see resolve_reft_component_path) -- it does not affect which
-    weights are loaded, since `lora_model` is already an instantiated model.
-
-    Freezing behaviour:
-      - `freeze_previous_phase=True` explicitly freezes the LoRA adapter
-        parameters first (belt-and-braces).
-      - pyreft.get_reft_model() *also* freezes every remaining parameter of
-        the wrapped model by design -- that's the whole point of ReFT: adapt
-        frozen representations via a small intervention instead of updating
-        weights. So after this call, the classification head and backbone end
-        up frozen too; only the newly added LoReFT intervention parameters
-        are trainable. That matches "train LoRA, freeze it, apply ReFT".
-    """
-    import pyreft
-
-    if freeze_previous_phase:
-        freeze_lora_parameters(lora_model)
-
-    hidden_size = int(lora_model.base_model.model.backbone.config.hidden_size)
-    component_path = resolve_reft_component_path(lora_model, layer_target, model_name)
-
-    # NOTE: pyreft.ReftConfig expects `representations` as plain dict(s), NOT a
-    # pyreft.RepresentationConfig object -- no such class exists in pyreft's
-    # public API. Every real example in pyreft's own README/docs builds it this way.
-    reft_config = pyreft.ReftConfig(
-        representations=[
-            {
-                "layer": layer_target,
-                "component": component_path,
-                "low_rank_dimension": reft_rank,
-                "intervention": pyreft.LoreftIntervention(
-                    embed_dim=hidden_size,
-                    low_rank_dimension=reft_rank,
-                ),
-            }
-        ]
-    )
-
-    # set_device=False prevents PyReft from probing custom module properties during init
-    heft_model = pyreft.get_reft_model(lora_model, reft_config, set_device=False)
-
-    return heft_model

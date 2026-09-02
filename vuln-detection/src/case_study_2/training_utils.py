@@ -1,44 +1,9 @@
 from __future__ import annotations
 
-"""
-Shared PyTorch training loop with validation-PR-AUC early stopping.
+"""Shared PyTorch training loop with validation-PR-AUC early stopping, used by EXP-4."""
 
-CONTEXT (see handoff notes / PDD addendum): EXP-4 (LoRA/CodeBERTa), EXP-5
-(HEFT LoRA+ReFT/CodeBERTa) and EXP-7 (LoRA/NeoBERT) each had their own
-hand-written `for epoch in range(fixed_epochs)` training loop with no
-validation checkpointing -- the model was simply trained for a fixed,
-hand-picked number of epochs and the LAST epoch's weights were used,
-regardless of whether training loss (let alone validation performance) had
-actually plateaued.
-
-This is inconsistent with the rest of the project: Track A's MLP
-(case_study_1/exp2/exp2_mlp.py::_train_mlp_with_early_stopping) already does
-proper early stopping with a patience/min_delta rule and best-checkpoint
-restoration, and Track B's own linear probe (EXP-3) is a sklearn
-LogisticRegression(solver="lbfgs") that converges on a real gradient
-tolerance. EXP-4/5/7 were the odd ones out.
-
-Diagnostic evidence that this was a real (not hypothetical) problem:
-  - EXP-7 (NeoBERT LoRA) canonical retrain: loss 1.1424 -> 1.0220 -> 0.9392
-    -> 0.8328 over 4 epochs -- still falling steadily, no sign of plateau.
-  - EXP-4 (CodeBERTa LoRA) canonical retrain: loss 1.1369 -> 1.0712 -> 1.0228
-    -> 0.9808 over 4 epochs -- decelerating but still declining.
-  - EXP-5 (CodeBERTa HEFT) Phase-1 LoRA sub-stage only ran 2 epochs (fewer
-    than EXP-4's own 4), while Phase-2 ReFT was already flat by epoch 2
-    (1.0449 -> 1.0435) -- ReFT converges fast, but its LoRA foundation was
-    undertrained even relative to EXP-4's own (also undertrained) LoRA.
-
-This module factors out ONE early-stopping loop (mirroring exp2_mlp.py's
-convention: track val PR-AUC as the primary selection metric, val loss as a
-tie-break, `min_delta` to avoid stopping on noise, `patience` epochs of no
-improvement before stopping, always restore the best-epoch weights) so
-EXP-4/5/7 all use the same, tested convergence criterion instead of three
-slightly different copy-pasted loops.
-"""
-
-import copy
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -73,22 +38,7 @@ def run_training_with_early_stopping(
     phase_name: str = "train",
     total_steps_per_epoch: Optional[int] = None,
 ) -> Tuple[np.ndarray, int, List[Dict[str, Any]]]:
-    """
-    Generic epoch loop: trains `model` via `forward_fn(model, input_ids,
-    attention_mask) -> logits`, evaluates PR-AUC + loss on val_loader after
-    every epoch, and (if es_config.enabled) stops once `patience` epochs pass
-    with no PR-AUC improvement beyond `min_delta`, restoring the best-epoch
-    weights before returning.
-
-    Returns (best_val_scores, best_epoch, history) where `history` is a list
-    of per-epoch dicts (epoch, train_loss, val_loss, val_pr_auc,
-    is_best_epoch) -- same shape as exp2_mlp.py's history_rows, useful for
-    plotting/auditing convergence after the fact.
-
-    If es_config.enabled=False, this simply runs all `max_epochs` epochs and
-    returns the LAST epoch (old behaviour), for cases where a caller
-    explicitly wants a fixed-epoch run (e.g. reproducing a prior result).
-    """
+    """Train with validation-PR-AUC early stopping; returns (best_scores, best_epoch, per-epoch history)."""
     t0 = time.time()
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     best_val_pr_auc = float("-inf")
@@ -138,7 +88,7 @@ def run_training_with_early_stopping(
             optimizer.step()
             optimizer.zero_grad()
 
-        # --- validation pass -------------------------------------------------
+        # Validation pass.
         model.eval()
         val_scores_parts, val_labels_parts = [], []
         val_loss_sum, val_rows = 0.0, 0
@@ -161,8 +111,7 @@ def run_training_with_early_stopping(
         val_pr_auc = float(average_precision_score(val_labels, val_scores)) if val_rows else float("nan")
         val_loss = float(val_loss_sum / max(val_rows, 1))
 
-        # Same tie-break rule as exp2_mlp.py: PR-AUC is primary, val loss
-        # breaks near-ties (within min_delta) so we don't chase noise.
+        # PR-AUC is primary; val loss breaks near-ties within min_delta.
         improved = (
             val_pr_auc > best_val_pr_auc + es_config.min_delta
             or (
@@ -214,21 +163,7 @@ def run_training_with_early_stopping(
                 )
             break
 
-    # NOTE (pyreft/pyvene ReFT-intervention quirk, surfaced first on EXP-8/NeoBERT's
-    # symbolic ".output" component path -- see models.py::resolve_reft_component_path):
-    # pyreft's LoReFT intervention parameters (rotate_layer, learned_source, plus the
-    # embed_dim/interchange_dim buffers) are reachable via model.parameters() -- which
-    # is how the optimizer trains them -- but are NOT always reachable via the standard
-    # nn.Module.state_dict() traversal when the model was attached with
-    # attach_reft_to_lora_model(..., set_device=False). strict=True load_state_dict()
-    # then raises "Missing key(s)" purely because best_state (itself built from an
-    # earlier model.state_dict() call) never had those keys either -- both snapshots
-    # are consistently missing the same intervention-only keys, so this is a
-    # state_dict-visibility gap, not a real data-loss bug. Falling back to
-    # strict=False restores everything state_dict() DOES expose (LoRA/backbone/head)
-    # and leaves those specific intervention params at their current (already-trained)
-    # values, which is exactly correct when the current epoch IS the best epoch.
-    # Warn loudly (never fail silently) so a genuine future regression is still caught.
+    # Falls back to strict=False if the best-epoch snapshot is missing keys; warns rather than failing silently.
     try:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     except RuntimeError as exc:
@@ -245,8 +180,7 @@ def run_training_with_early_stopping(
         )
 
     if best_scores is None:
-        # Degenerate case (max_epochs somehow 0) -- shouldn't happen in
-        # practice, but avoid returning None rather than silently failing.
+        # max_epochs=0 edge case: return an empty array instead of None.
         best_scores = np.array([])
 
     return best_scores, best_epoch, history

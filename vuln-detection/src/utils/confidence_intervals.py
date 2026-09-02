@@ -1,34 +1,7 @@
 """Project-block bootstrap confidence intervals for pooled predictions.
 
-Rows in this project are not independent: they are grouped by `project`.
-A row-level bootstrap would violate the same non-independence assumption
-that the grouped CV / holdout split was built to protect, so every
-interval here resamples whole projects with replacement, never rows.
-
-Design decisions (see project discussion, do not relax without re-reading it):
-- Threshold-independent metrics (PR-AUC, ROC-AUC) are computed directly on
-  y_score. Threshold-dependent metrics (precision, recall, F1) are also
-  supported, but ONLY at a single, explicitly fixed decision threshold
-  (`threshold`, default 0.5 -- the same fixed threshold used elsewhere in
-  this project's reporting, see PDD Section 7.5). Reporting these without a
-  CI is misleading given the project-block resampling variance already
-  observed for PR-AUC; unlike PR-AUC/ROC-AUC, their CI additionally reflects
-  the arbitrariness of that fixed threshold choice, not sampling variance
-  alone -- callers should not treat a wide precision/recall/F1 interval as
-  equivalent evidence to a PR-AUC interval of the same width.
-- Percentile method, not normal-approximation: the bootstrap distribution
-  of PR-AUC under a rare positive class can be skewed.
-- Degenerate resamples (no positive class, or all-positive) are dropped
-  and counted rather than silently ignored.
-- These intervals quantify sampling variability *within this dataset
-  only*. They are not an estimate of generalization uncertainty to C
-  functions outside this collection, and for nested-CV pooled
-  predictions they do not capture the extra variability from re-running
-  the outer split with a different seed (Bengio & Grandvalet, 2004).
-- Comparing two experiments by eye-balling overlap between two separately
-  computed marginal CIs is not a valid test. Use paired_bootstrap_metric_ci
-  instead, which resamples the same projects for both experiments and
-  builds the interval on the difference.
+Rows are grouped by project, not independent, so every interval here
+resamples whole projects with replacement (percentile method), never rows.
 """
 
 from __future__ import annotations
@@ -69,12 +42,7 @@ ALL_METRICS = tuple(sorted(set(SUPPORTED_METRICS) | set(THRESHOLD_METRICS)))
 
 
 def _resolve_metric_fn(metric: str, threshold: float) -> Callable[[np.ndarray, np.ndarray], float]:
-    """Returns a (y_true, y_score) -> float callable for `metric`.
-
-    Threshold-dependent metrics are wrapped to binarize y_score at
-    `threshold` first, so every entry in SUPPORTED_METRICS/THRESHOLD_METRICS
-    can be called uniformly as metric_fn(y_true, y_score) everywhere below.
-    """
+    """Return a uniform (y_true, y_score) -> float callable for `metric`, thresholding if needed."""
     if metric in SUPPORTED_METRICS:
         return SUPPORTED_METRICS[metric]
     if metric in THRESHOLD_METRICS:
@@ -84,6 +52,7 @@ def _resolve_metric_fn(metric: str, threshold: float) -> Callable[[np.ndarray, n
 
 
 def _require_ci_columns(frame: pd.DataFrame) -> None:
+    """Raise a clear error if a required column is missing."""
     missing = [c for c in REQUIRED_CI_COLUMNS if c not in frame.columns]
     if missing:
         raise KeyError(
@@ -97,6 +66,7 @@ def _resample_rows_for_groups(
     sampled_groups: np.ndarray,
     group_column: str,
 ) -> pd.DataFrame:
+    """Rebuild a resampled frame from a list of sampled group keys."""
     grouped = predictions.groupby(group_column, sort=False)
     parts = [grouped.get_group(g) for g in sampled_groups]
     return pd.concat(parts, ignore_index=True)
@@ -104,6 +74,8 @@ def _resample_rows_for_groups(
 
 @dataclass(frozen=True)
 class BootstrapCIResult:
+    """Result of a single-experiment project-block bootstrap CI."""
+
     metric_name: str
     point_estimate: float
     ci_low: float
@@ -116,6 +88,7 @@ class BootstrapCIResult:
     random_state: int
 
     def as_dict(self) -> dict:
+        """Return fields as a plain dict for JSON serialization."""
         return dict(self.__dict__)
 
 
@@ -129,11 +102,7 @@ def bootstrap_metric_ci(
     min_positive_count: int = 1,
     threshold: float = 0.5,
 ) -> BootstrapCIResult:
-    """Project-block bootstrap CI for one metric (threshold-independent or not).
-
-    `threshold` only applies to threshold-dependent metrics (precision,
-    recall, f1); ignored for average_precision_pr_auc / roc_auc.
-    """
+    """Project-block bootstrap CI for one metric (`threshold` only used for precision/recall/f1)."""
     _require_ci_columns(predictions)
     metric_fn = _resolve_metric_fn(metric, threshold)
 
@@ -179,6 +148,8 @@ def bootstrap_metric_ci(
 
 @dataclass(frozen=True)
 class PairedBootstrapCIResult:
+    """Result of a paired project-block bootstrap CI on the difference between two experiments."""
+
     metric_name: str
     experiment_a: str
     experiment_b: str
@@ -195,6 +166,7 @@ class PairedBootstrapCIResult:
     random_state: int
 
     def as_dict(self) -> dict:
+        """Return fields as a plain dict for JSON serialization."""
         return dict(self.__dict__)
 
 
@@ -211,13 +183,7 @@ def paired_bootstrap_metric_ci(
     min_positive_count: int = 1,
     threshold: float = 0.5,
 ) -> PairedBootstrapCIResult:
-    """Paired project-block bootstrap CI on the difference between two experiments.
-
-    Both prediction frames must cover the same partition (identical set of
-    projects), since the same resampled groups are used for both sides.
-    `threshold` only applies to threshold-dependent metrics (precision,
-    recall, f1); ignored for average_precision_pr_auc / roc_auc.
-    """
+    """Paired bootstrap CI on the difference between two experiments over the same projects."""
     _require_ci_columns(predictions_a)
     _require_ci_columns(predictions_b)
     metric_fn = _resolve_metric_fn(metric, threshold)
@@ -291,6 +257,7 @@ def paired_bootstrap_metric_ci(
 
 
 def format_ci_report(result: BootstrapCIResult) -> str:
+    """Format a bootstrap CI result as a short human-readable report."""
     lines = [
         f"{result.metric_name}: point estimate = {result.point_estimate:.4f}",
         f"  {int(result.confidence * 100)}% CI (project-block bootstrap): "
@@ -305,6 +272,7 @@ def format_ci_report(result: BootstrapCIResult) -> str:
 
 
 def format_paired_ci_report(result: PairedBootstrapCIResult) -> str:
+    """Format a paired bootstrap CI result as a short human-readable report."""
     lines = [
         f"{result.metric_name}: {result.experiment_a} = {result.point_estimate_a:.4f}, "
         f"{result.experiment_b} = {result.point_estimate_b:.4f}",
