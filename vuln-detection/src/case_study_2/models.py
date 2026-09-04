@@ -11,9 +11,6 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 
-DEFAULT_CODE_MODEL = "huggingface/CodeBERTa-small-v1"
-DEFAULT_CODE_TOKENIZER = "huggingface/CodeBERTa-small-v1"
-
 # NeoBERT-250M backbone (Chandar Research Lab); ships as trust_remote_code on the Hub.
 DEFAULT_NEOBERT_MODEL = "chandar-lab/NeoBERT"
 DEFAULT_NEOBERT_TOKENIZER = "chandar-lab/NeoBERT"
@@ -77,7 +74,7 @@ def _apply_neobert_config_overrides(config: Any) -> Any:
 
 
 def load_code_tokenizer(
-    tokenizer_name: str = DEFAULT_CODE_TOKENIZER,
+    tokenizer_name: str = DEFAULT_NEOBERT_TOKENIZER,
     hf_cache_dir: Optional[str] = None,
     trust_remote_code: Optional[bool] = None,
 ):
@@ -94,7 +91,7 @@ def load_code_tokenizer(
 
 
 def load_code_encoder(
-    model_name: str = DEFAULT_CODE_MODEL,
+    model_name: str = DEFAULT_NEOBERT_MODEL,
     dtype_policy: str = "auto",
     device: Optional[str] = None,
     freeze: bool = True,
@@ -158,7 +155,7 @@ class CodeSequenceClassifier(nn.Module):
 
     def __init__(
         self,
-        model_name: str = DEFAULT_CODE_MODEL,
+        model_name: str = DEFAULT_NEOBERT_MODEL,
         num_labels: int = 1,
         freeze_backbone: bool = False,
         pooling: str = "mean",
@@ -254,7 +251,7 @@ def infer_lora_target_modules(model: nn.Module) -> List[str]:
 
 
 def create_lora_sequence_classifier(
-    model_name: str = DEFAULT_CODE_MODEL,
+    model_name: str = DEFAULT_NEOBERT_MODEL,
     rank: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
@@ -288,7 +285,7 @@ def create_lora_sequence_classifier(
 
 
 def get_lora_model(
-    model_name: str = DEFAULT_CODE_MODEL,
+    model_name: str = DEFAULT_NEOBERT_MODEL,
     rank: int = 8,
     lora_alpha: int = 16,
     pooling: str = "mean",

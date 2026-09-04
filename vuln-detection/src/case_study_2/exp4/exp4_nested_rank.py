@@ -227,7 +227,7 @@ def run_exp4_nested_rank(
             continue
 
         fold_t0 = time.time()
-        print(f"\n=================== OUTER FOLD {outer_fold_id} ({len(completed_folds)+1}/{len(fold_ids)}) ===================")
+        print(f"\n[nested] Outer fold {outer_fold_id} ({len(completed_folds)+1}/{len(fold_ids)}) starting")
 
         outer_train_ids = manifest.loc[manifest[config.fold_column] != outer_fold_id, config.source_id_column]
         outer_val_ids = manifest.loc[manifest[config.fold_column] == outer_fold_id, config.source_id_column]
