@@ -70,7 +70,7 @@ from utils.split_manifest import SplitConfig, apply_manifest, assert_manifest_in
 from ..static_features import FEATURE_COLUMNS
 
 
-EXP2_VERSION = "cs1-exp2-svd-static-mlp-v2-nested-rotating-5fold"
+EXP2_VERSION = "cs1-exp2-svd-static-mlp-v3-resumable-rotating-5fold"
 
 
 @dataclass(frozen=True)
@@ -824,6 +824,62 @@ def _fit_outer_fold(
     return predictions, training_metadata, training_history
 
 
+def _checkpoint_paths(output_dir: Path, outer_fold_id: int) -> dict[str, Path]:
+    """Filesystem locations for one outer fold's resumable checkpoint."""
+    root = output_dir / "checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    prefix = f"outer_fold_{outer_fold_id}"
+    return {
+        "predictions": root / f"{prefix}_predictions.parquet",
+        "inner_search": root / f"{prefix}_inner_search.parquet",
+        "training": root / f"{prefix}_training.json",
+        "history": root / f"{prefix}_training_history.parquet",
+    }
+
+
+def _write_outer_checkpoint(
+    output_dir: Path,
+    outer_fold_id: int,
+    predictions: pd.DataFrame,
+    inner_summary: pd.DataFrame,
+    training: dict,
+    history: pd.DataFrame,
+) -> None:
+    """Persist one outer fold's final result so a later run can resume without refitting."""
+    paths = _checkpoint_paths(output_dir, outer_fold_id)
+    predictions.to_parquet(paths["predictions"], index=False)
+    inner_summary.to_parquet(paths["inner_search"], index=False)
+    with paths["training"].open("w", encoding="utf-8") as f:
+        json.dump(training, f, indent=2, default=str)
+    history.to_parquet(paths["history"], index=False)
+
+
+def _load_outer_checkpoint(output_dir: Path, outer_fold_id: int) -> Optional[dict]:
+    """Load one outer fold's checkpoint if it exists and is complete."""
+    paths = _checkpoint_paths(output_dir, outer_fold_id)
+    if not all(p.exists() for p in paths.values()):
+        return None
+    with paths["training"].open("r", encoding="utf-8") as f:
+        training = json.load(f)
+    return {
+        "predictions": pd.read_parquet(paths["predictions"]),
+        "inner_search": pd.read_parquet(paths["inner_search"]),
+        "training": training,
+        "history": pd.read_parquet(paths["history"]),
+    }
+
+
+def _update_run_state(state_path: Path, completed_folds, status: str) -> None:
+    """Persist which outer folds are done, for resumability and progress inspection."""
+    state = {
+        "status": status,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+        "completed_outer_folds": sorted(int(f) for f in completed_folds),
+    }
+    with state_path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
 def run_exp2_profile_fold(
     normalized_frame: pd.DataFrame,
     static_features_frame: pd.DataFrame,
@@ -923,20 +979,42 @@ def run_exp2(
     config: Exp2Config = Exp2Config(),
     output_dir: Optional[Path | str] = None,
     additional_metadata: Optional[Mapping[str, object]] = None,
+    resume: bool = True,
 ) -> dict:
-    """Run the official rotating 5-fold CS1-EXP2-MLP experiment, with a staged inner-CV search per outer fold."""
+    """Run the official rotating 5-fold CS1-EXP2-MLP experiment, with a staged inner-CV search per outer fold.
+
+    If output_dir is given, each outer fold's result is checkpointed to
+    output_dir/checkpoints/ as soon as it completes. A later call with the
+    same output_dir and resume=True (the default) skips already-completed
+    folds and reuses their checkpoint instead of refitting, so an
+    interrupted run can continue rather than restart from scratch.
+    """
     _validate_config(config)
     _log(f"CS1-EXP2 official run started: {config.n_splits} rotating outer folds.", config.verbose)
 
     dataset, static_lookup = _prepare_dataset_and_static_lookup(normalized_frame, static_features_frame, manifest, config)
 
+    output_path = Path(output_dir) if output_dir is not None else None
+    state_path = output_path / "exp2_run_state.json" if output_path is not None else None
+
     all_predictions: list[pd.DataFrame] = []
     all_inner_search: list[pd.DataFrame] = []
     all_training_history: list[pd.DataFrame] = []
     training_rows: list[dict] = []
+    completed_folds: list[int] = []
     run_start = time.perf_counter()
 
     for fold_id in range(config.n_splits):
+        checkpoint = _load_outer_checkpoint(output_path, fold_id) if (resume and output_path is not None) else None
+        if checkpoint is not None:
+            all_predictions.append(checkpoint["predictions"])
+            all_inner_search.append(checkpoint["inner_search"])
+            all_training_history.append(checkpoint["history"])
+            training_rows.append(checkpoint["training"])
+            completed_folds.append(fold_id)
+            _log(f"Outer fold {fold_id + 1}/{config.n_splits}: loaded from checkpoint, skipping.", config.verbose)
+            continue
+
         train_frame = dataset.loc[dataset[config.fold_column] != fold_id].reset_index(drop=True)
         test_frame = dataset.loc[dataset[config.fold_column] == fold_id].reset_index(drop=True)
         if train_frame.empty or test_frame.empty:
@@ -945,12 +1023,20 @@ def run_exp2(
         inner_summary, selection = _run_inner_search(train_frame, static_lookup, fold_id, config)
         fold_predictions, fold_metadata, fold_history = _fit_outer_fold(train_frame, test_frame, static_lookup, fold_id, selection, config)
 
+        if output_path is not None:
+            _write_outer_checkpoint(output_path, fold_id, fold_predictions, inner_summary, fold_metadata, fold_history)
+            completed_folds.append(fold_id)
+            _update_run_state(state_path, completed_folds, status="running")
+
         all_predictions.append(fold_predictions)
         all_inner_search.append(inner_summary)
         all_training_history.append(fold_history)
         training_rows.append(fold_metadata)
         del train_frame, test_frame
         gc.collect()
+
+    if state_path is not None:
+        _update_run_state(state_path, completed_folds, status="completed")
 
     oof_predictions = pd.concat(all_predictions, ignore_index=True).sort_values("source_row_id", kind="stable").reset_index(drop=True)
     fold_training = pd.DataFrame(training_rows).sort_values("fold").reset_index(drop=True)
